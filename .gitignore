@@ -1,0 +1,7 @@
+env_dogo/
+*.pyc
+__pycache__/
+*.jpg
+*.png
+*.mp4
+*.avi
