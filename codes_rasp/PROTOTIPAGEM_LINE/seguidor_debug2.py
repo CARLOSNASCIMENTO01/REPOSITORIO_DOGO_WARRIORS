@@ -1462,7 +1462,7 @@ if __name__ == "__main__":
                 continue
 
             except Exception as e:
-                print("[ERRO] loop principal falhou:", repr(e))
+                print("[ERRO] loop principal falh:", repr(e))
                 parar()
                 time.sleep(0.5)
                 continue
