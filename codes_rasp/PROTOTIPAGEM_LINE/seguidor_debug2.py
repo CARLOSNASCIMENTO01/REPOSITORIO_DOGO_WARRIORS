@@ -60,14 +60,14 @@ def checar_parada():
 # =========================================================================
 # CONFIG (NAO ALTERADO)
 # =========================================================================
-Kp = 1.6
-Kd = 0.7
-VEL_BASE = 25
-VEL_MAX  = 50
+Kp = 1.9 #1.6, 1,8
+Kd = 0.5 # 0.7, 0.5
+VEL_BASE = 22
+VEL_MAX  = 45
 VEL_MIN  = -VEL_MAX
 VEL_GAP  = 25
 LIMIAR   = 80
-DEADZONE = 8
+DEADZONE = 0 # 8, 0
 AREA_MIN = 11000
 
 IN1, IN2, ENA = 17, 18, 12
@@ -1160,7 +1160,7 @@ def verde(roi):
         mover(-10, -10)
         time.sleep(0.1)
         mover(30, 30)
-        time.sleep(0.15)
+        time.sleep(0.18)
         parar()
         guinada2('E', 85, 40)
         inicio = time.time()
@@ -1177,7 +1177,7 @@ def verde(roi):
         mover(-10, -10)
         time.sleep(0.1)
         mover(30, 30)
-        time.sleep(0.15)
+        time.sleep(0.18)
         parar()
         guinada2('D', 85, 40)
         inicio = time.time()
