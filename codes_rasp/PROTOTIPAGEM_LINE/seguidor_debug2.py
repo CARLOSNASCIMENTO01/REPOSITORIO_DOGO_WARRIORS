@@ -60,14 +60,14 @@ def checar_parada():
 # =========================================================================
 # CONFIG (NAO ALTERADO)
 # =========================================================================
-Kp = 1.9 #1.6, 1,8
-Kd = 0.5 # 0.7, 0.5
-VEL_BASE = 22
-VEL_MAX  = 45
+Kp = 1.8 #1.6, 1,9
+Kd = 0.7 # 0.7, 0.5, 0.9
+VEL_BASE = 25 #20, 25
+VEL_MAX  = 50 #45
 VEL_MIN  = -VEL_MAX
 VEL_GAP  = 25
 LIMIAR   = 80
-DEADZONE = 0 # 8, 0
+DEADZONE =5 # 8, 0
 AREA_MIN = 11000
 
 IN1, IN2, ENA = 17, 18, 12
@@ -261,7 +261,7 @@ def resetar_giroscopio():
         gyro_ultimo_tempo = time.time()
 
 def angulo_x(): return int(ang_gyro["X"])
-def angulo_y(): return int(ang_gyro["Y"])
+def angulo_y(): return angulo_y_estavel()
 def angulo_z(): return int(ang_gyro["Z"])
 
 def _gyro_thread():
@@ -304,6 +304,50 @@ def iniciar_mpu():
 dados = {"F": 9999.0, "E": 9999.0}
 ultimo_recebimento = time.time()
 ser = None
+
+
+
+# ==========================================================
+# �NGULO Y EST�VEL (RAMPA/GANGORRA)
+# Usa somente o aceler�metro + filtro exponencial
+# ==========================================================
+
+ACCEL_XOUT_H = 0x3B
+ACCEL_YOUT_H = 0x3D
+ACCEL_ZOUT_H = 0x3F
+
+_angulo_y_filtrado = None
+
+def angulo_y_estavel(alpha=0.97):
+    """
+    Retorna o �ngulo Y em graus.
+    alpha:
+        0.95 = responde mais r�pido
+        0.97 = recomendado
+        0.99 = muito est�vel
+    """
+
+    global _angulo_y_filtrado
+
+    ax = _mpu_read_word(ACCEL_XOUT_H) / 16384.0
+    ay = _mpu_read_word(ACCEL_YOUT_H) / 16384.0
+    az = _mpu_read_word(ACCEL_ZOUT_H) / 16384.0
+
+    angulo = math.degrees(
+        math.atan2(-ax, math.sqrt(ay * ay + az * az))
+    )
+
+    if _angulo_y_filtrado is None:
+        _angulo_y_filtrado = angulo
+    else:
+        _angulo_y_filtrado = (
+            alpha * _angulo_y_filtrado +
+            (1 - alpha) * angulo
+        )
+
+    return int(_angulo_y_filtrado)
+
+
 
 def detectar_porta(sair_se_falhar=True):
     try:
@@ -1063,6 +1107,7 @@ def desvio():
     if distancia_frente() <= 6:
         time.sleep(0.09)
         if distancia_frente() <= 5:
+            mover(30, 30)
             mover(-30, -30)
             time.sleep(0.2)
             mover(-10, -10)
@@ -1129,6 +1174,7 @@ def desvio():
 
 
 def verde(roi):
+   
     acao_verde = detectar_verde(roi)
     if not acao_verde:
         return
@@ -1155,6 +1201,7 @@ def verde(roi):
 
     acao_verde = acao_confirmada
     parar()
+  
 
     if acao_verde == "ESQUERDA":
         mover(-10, -10)
@@ -1193,7 +1240,7 @@ def verde(roi):
         print("gira 180")
         mover(-12, -12)
         time.sleep(0.09)
-        guinada_pid("D", 175)
+        guinada_pid("D", 170)
         mover(30, 30)
         time.sleep(0.19)
         mover(-10, -10)
@@ -1322,7 +1369,7 @@ def controle(cx, contours, roi):
         velocidade_base = 60
         velL = np.clip(velocidade_base + ajuste, 20, 100)
         velR = np.clip(velocidade_base - ajuste, 20, 100)
-    elif angulo_y() >= 14 and contador_gangorra == 0:
+    elif angulo_y() >= 10 and contador_gangorra == 0:
         contador_gangorra = 1
         mover(-10, -10)
         time.sleep(1.0)
@@ -1384,7 +1431,7 @@ def loop_principal():
             while True:
                 checar_parada()
                 mover(100, 100)
-                time.sleep(0.2)
+                time.sleep(0.3)
                 ret, frame_trav = cap.read()
                 if ret:
                     _, _, roi_trav, _ = visao(frame_trav)
@@ -1454,6 +1501,7 @@ if __name__ == "__main__":
             try:
                 robo_ativo.wait()
                 loop_principal()
+                #print(angulo_y())
 
             except RoboParado:
                 parar()
