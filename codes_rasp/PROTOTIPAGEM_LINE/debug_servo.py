@@ -69,24 +69,9 @@ def parar_servo(pino):
 
 
 try:
-    print("Pesado -> 90 graus (vel 20%)")
-    mover_servo(PINO_PESADO, 150, velocidade=0)
-    print("Pesado -> 90 graus (vel 20%)")
-    mover_servo_direto(PINO_SG90, 0)
-    mover_servo(PINO_PESADO, 0, velocidade=5)
-    print("Pesado -> 90 graus (vel 20%)")
-    mover_servo_direto(PINO_SG90, 0)
-    print("Pesado -> 90 graus (vel 20%)")
-    mover_servo(PINO_PESADO, 90, velocidade=5)
-    print("Pesado -> 90 graus (vel 20%)")
-    mover_servo_direto(PINO_SG90, 160)
-    time.sleep(2.0)
-    # Oscilação rápida, sem suavidade, entre 70 e 90 graus
-    mover_servo_direto(PINO_SG90, 160)
-    oscilar_servo_rapido(PINO_PESADO, angulo_a=30, angulo_b=120, repeticoes=20, delay=0.1)
 
-    parar_servo(PINO_SG90)
-    parar_servo(PINO_PESADO)
+    
+    mover_servo_direto(PINO_SG90,150)
 
 finally:
     lgpio.gpiochip_close(h)

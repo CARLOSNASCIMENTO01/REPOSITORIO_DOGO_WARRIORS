@@ -104,7 +104,7 @@ VICTIM_MODEL_PATH   = "modelon.onnx"
 VICTIM_CROP_W, VICTIM_CROP_H = 320, 240
 VICTIM_CONF_THRES   = 0.35
 VICTIM_FRAMES_WARMUP = 3
-VICTIM_FRAMES_ANALISE = 3000000000
+VICTIM_FRAMES_ANALISE = 30
 DEBUG_VITIMA_PREVIEW =True
 
 # --- RESET DE USB VIA SOFTWARE ---
@@ -1083,25 +1083,7 @@ def girar_ate_linha(direcao, velocidade=60, tolerancia=40, timeout=5.0):
 
 def area(contours):
     print("estou na area")
-    identificar_vitimas()  # <- chama a 2a camera + inferencia assim que entra no resgate
-    mover(-19, -19)
-    time.sleep(0.09)
-    maior = max(contours, key=cv2.contourArea)
-
-    while True:
-        checar_parada()
-        mover(25, 25)
-        if distancia_frente() <= 6 or (len(contours) == 1 and cv2.contourArea(maior) > AREA_MIN):
-            mover(-10, -10)
-            time.sleep(0.09)
-            if distancia_frente() <= 6:
-                guinada2("E", 45, 40)
-            if len(contours) == 1 and cv2.contourArea(maior) > AREA_MIN:
-                mover(-10, -10)
-                time.sleep(0.09)
-            break
-        time.sleep(0.01)
-
+    os.execv(sys.executable, [sys.executable, "/home/pi/ROBO_DOGO_2026/codes_rasp/PROTOTIPAGEM_LINE/resgate.py"])
 
 def desvio():
     if distancia_frente() <= 6:
@@ -1369,7 +1351,7 @@ def controle(cx, contours, roi):
         velocidade_base = 60
         velL = np.clip(velocidade_base + ajuste, 20, 100)
         velR = np.clip(velocidade_base - ajuste, 20, 100)
-    elif angulo_y() >= 10 and contador_gangorra == 0:
+    elif angulo_y() >= 8 and contador_gangorra == 0:
         contador_gangorra = 1
         mover(-10, -10)
         time.sleep(1.0)
