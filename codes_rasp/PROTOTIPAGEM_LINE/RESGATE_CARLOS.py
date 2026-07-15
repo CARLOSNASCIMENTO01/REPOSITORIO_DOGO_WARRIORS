@@ -4,6 +4,207 @@ import lgpio as GPIO
 import time
 import lgpio
 import numpy as np
+import sys
+import os
+import threading
+import smbus2
+import serial
+import math
+import serial.tools.list_ports
+from threading import Thread
+
+# ===================== BOTAO DE PARADA IMEDIATA (mesmo padrao do seguidor_debug2.py) =====================
+BUTTON = 24  # mesmo pino usado no codigo de linha
+
+class RoboParado(Exception):
+    """Levantada quando o botao pede parada, pra abortar QUALQUER loop na hora."""
+    pass
+
+robo_ativo = threading.Event()
+robo_ativo.set()  # comeca ligado
+
+def checar_parada():
+    """Chamar a cada iteracao de todo while/for que segura o robo por mais
+    de um instante (buscas, centralizacao, aproximacao, entrega, etc)."""
+    if not robo_ativo.is_set():
+        raise RoboParado()
+
+def botao_thread():
+    """Toggle com debounce: aperta -> para tudo na hora (mesmo no meio de
+    uma busca/aproximacao/entrega). Aperta de novo -> deixa o robo continuar
+    (retoma a busca por bolas do zero)."""
+    anterior = 0
+    while True:
+        estado = GPIO.gpio_read(h, BUTTON)
+        if estado == 0 and anterior == 1:
+            time.sleep(0.03)
+            if GPIO.gpio_read(h, BUTTON) == 0:
+                if robo_ativo.is_set():
+                    robo_ativo.clear()
+                    parar_motores()
+                    print("[BOTAO] PAROU")
+                else:
+                    print("[BOTAO] REINICIANDO...")
+                    robo_ativo.set()
+                while GPIO.gpio_read(h, BUTTON) == 1:
+                    time.sleep(0.02)
+        anterior = estado
+        time.sleep(0.02)
+
+
+# =========================================================================
+# SERIAL / ULTRASSONICO - portado do seguidor_debug2.py (so o sonar, F e E)
+# =========================================================================
+PORTA_FIXA = "/dev/serial/by-id/usb-FTDI_USB_Serial_Converter_FTB6SPL3-if00-port0"
+SERIAL_TIMEOUT_DADO = 0.5
+WATCHDOG_RECONEXAO = 2.0  # segundos sem dado novo pra forcar reconexao da porta
+
+dados = {"F": 9999.0, "E": 9999.0}
+ultimo_recebimento = time.time()
+ser = None
+_serial_thread_iniciada = [False]
+
+
+def detectar_porta(sair_se_falhar=True):
+    try:
+        s = serial.Serial(PORTA_FIXA, 115200, timeout=0.04)
+        print(f"[Serial] Conectado via ID fixo: {PORTA_FIXA}")
+        return s
+    except serial.SerialException:
+        pass
+
+    PALAVRAS_FTDI = ["ftdi", "ft232", "usb serial converter", "ftb6spl3"]
+    portas = serial.tools.list_ports.comports()
+
+    for p in portas:
+        desc = f"{p.description} {p.manufacturer or ''} {p.hwid or ''}".lower()
+        if any(palavra in desc for palavra in PALAVRAS_FTDI):
+            try:
+                s = serial.Serial(p.device, 115200, timeout=0.04)
+                print(f"[Serial] FTDI encontrado em: {p.device} - {p.description}")
+                return s
+            except serial.SerialException:
+                continue
+
+    for p in portas:
+        if "ttyUSB" in p.device or "ttyACM" in p.device:
+            try:
+                s = serial.Serial(p.device, 115200, timeout=0.04)
+                print(f"[Serial] Usando porta generica: {p.device} - {p.description}")
+                return s
+            except serial.SerialException:
+                continue
+
+    if sair_se_falhar:
+        print("\n[ERRO] Nenhuma porta serial encontrada!")
+        sys.exit(1)
+    return None
+
+
+def aguardar_porta(intervalo=1.0):
+    porta = detectar_porta(sair_se_falhar=False)
+    while porta is None:
+        print("[Serial] Arduino ainda nao apareceu, tentando de novo...")
+        time.sleep(intervalo)
+        porta = detectar_porta(sair_se_falhar=False)
+    return porta
+
+
+def handshake_serial():
+    global ser, ultimo_recebimento
+    ser = aguardar_porta()
+    time.sleep(2.0)
+    ser.reset_input_buffer()
+    ser.write(b"START\n")
+    time.sleep(2.0)
+    ser.reset_input_buffer()
+    ultimo_recebimento = time.time()
+    print("[Serial] Handshake enviado pro Arduino")
+
+
+def serial_thread():
+    global ultimo_recebimento, ser
+    while True:
+        try:
+            if ser is None or not ser.is_open:
+                print("[SERIAL] Porta indisponivel, tentando reconectar...")
+                novo = detectar_porta(sair_se_falhar=False)
+                if novo is not None:
+                    ser = novo
+                    try:
+                        ser.reset_input_buffer()
+                    except Exception:
+                        pass
+                    ultimo_recebimento = time.time()
+                    print("[SERIAL] Reconectado!")
+                else:
+                    time.sleep(1.0)
+                continue
+
+            if time.time() - ultimo_recebimento > WATCHDOG_RECONEXAO:
+                print(f"[SERIAL] Sem dado novo ha mais de {WATCHDOG_RECONEXAO:.0f}s, forcando reconexao...")
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser = None
+                continue
+
+            linha = None
+            while ser.in_waiting:
+                bruta = ser.readline().decode(errors="ignore").strip()
+                if bruta:
+                    linha = bruta
+
+            if linha is None:
+                time.sleep(0.005)
+                continue
+
+            ultimo_recebimento = time.time()
+            for parte in linha.split(","):
+                if ":" not in parte:
+                    continue
+                chave, valor = parte.split(":", 1)
+                if chave in dados:
+                    try:
+                        dados[chave] = float(valor)
+                    except ValueError:
+                        pass
+
+        except serial.SerialException as e:
+            print("[SERIAL] erro de conexao:", e)
+            try:
+                ser.close()
+            except Exception:
+                pass
+            ser = None
+            time.sleep(1.0)
+
+        except Exception as e:
+            print("[THREAD SERIAL] erro inesperado:", e)
+            time.sleep(0.1)
+
+
+def distancia_frente():
+    return dados["F"]
+
+
+def distancia_esquerda():
+    return dados["E"]
+
+
+def sonar_valido():
+    return (time.time() - ultimo_recebimento) < SERIAL_TIMEOUT_DADO
+
+
+def iniciar_serial():
+    """Sobe a thread do sonar e faz o handshake, uma vez so."""
+    if _serial_thread_iniciada[0]:
+        return
+    handshake_serial()
+    threading.Thread(target=serial_thread, daemon=True).start()
+    _serial_thread_iniciada[0] = True
+
 
 # ===================== DETECÇÃO DE TRIÂNGULO (área de entrega) =====================
 ALVO_COR = None  # None = aceita verde OU vermelho; setado dinamicamente em entregar_bola()
@@ -36,18 +237,13 @@ AREA_MIN_TRI = 500
 AREA_MAX_TRI = 1000000
 
 STOP_AREA_RATIO_TRIANGULO = 0.80   # ajustar na prática, igual fizemos com a bola
-TRIANGULO_MAX_GIROS = 60
-TRIANGULO_LOST_FRAMES = 8
-
-# ---- Limiar de área "ativo" (usado por _eh_triangulo) ----
-# Fica em AREA_MIN_TRI no dia a dia. Durante entregar_bola() ele sobe pra
-# AREA_MIN_TRI_BUSCA (pra ignorar retalhos/manchas verdes pequenas fora da
-# área de resgate) e volta sozinho pro valor normal no final da entrega.
-# Ajuste AREA_MIN_TRI_BUSCA olhando os prints "Area=..." no console: pegue
-# um valor entre a maior mancha de ruído que aparece e a menor área real do
-# triângulo que você quer aceitar.
-AREA_MIN_TRI_BUSCA = 1500
-_area_min_tri_ativo = AREA_MIN_TRI
+TRIANGULO_MAX_GIROS = 90
+TRIANGULO_MAX_APPROACH_STEPS = 90
+TRIANGULO_LOST_FRAMES = 15
+TRIANGULO_APPROACH_SPEED = 30
+TRIANGULO_APPROACH_STEP_TIME = 0.15
+TRIANGULO_CENTER_MAX_TENTATIVAS = 25
+TRIANGULO_CENTER_LOST_FRAMES = 15
 # ===================== CONFIGURAÇÕES =====================
 MODEL_PATH = "model.onnx"
 CAMERA_INDEX = "/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0"
@@ -78,16 +274,212 @@ CENTER_MAX_TENTATIVAS = 15
 CENTER_LOST_FRAMES = 5
 
 
+MAX_ENTREGAS = 3
+BUSCA_FINAL_MAX_GIROS = 20  # ajustar na prática
+
+# ===================== CÂMERA DE BAIXO (linha/chão) - usada só na saída =====================
+# Camera separada, apontada pro chao, so pra enxergar a linha preta/contorno
+# preto durante o acionar_saida(). Ajuste o path/indice pro seu setup.
+CAMERA_INDEX_LINHA = "/dev/v4l/by-id/usb-Generic_USB_Camera_200901010002-video-index0"
+CAMERA_LINHA_INDEX_FALLBACK = 0
+LINHA_W, LINHA_H = 160, 120
+LIMIAR_LINHA = 80
+AREA_MIN_LINHA = 11000
+kernel_linha = np.ones((3, 3), np.uint8)
+
+# ===================== LIMIARES DA SAÍDA (acionar_saida) =====================
+
+DIST_LATERAL_ABERTA_CM = 40   # muita distancia no ultrassonico lateral = campo aberto
+DIST_PAREDE_FRENTE_CM = 10    # pouca distancia no ultrassonico da frente = parede
+
 # Pinos
-PINO_SG90 = 20
-PINO_PESADO = 16
+PINO_SG90 = 21
+PINO_PESADO = 20
 
 ANGULO_INICIAL = 90
+
+_gyro_lock = threading.Lock()
+MPU_ADDR    = 0x68
+GYRO_XOUT_H = 0x43
+bus = smbus2.SMBus(1)
+
+ang_gyro          = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+gyro_offset       = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+gyro_ultimo_tempo = time.time()
+
+def _mpu_write(reg, val):
+    bus.write_byte_data(MPU_ADDR, reg, val)
+
+def _mpu_read_word(reg, tentativas=3):
+    for tentativa in range(tentativas):
+        try:
+            hi = bus.read_byte_data(MPU_ADDR, reg)
+            lo = bus.read_byte_data(MPU_ADDR, reg + 1)
+
+            valor = (hi << 8) | lo
+
+            if valor >= 0x8000:
+                valor -= 65536
+
+            return valor
+
+        except OSError as e:
+            # Remote I/O error (121), muito comum em impactos
+            if tentativa == tentativas - 1:
+                raise
+            time.sleep(0.001)
+
+def _normalizar(ang):
+    while ang > 180: ang -= 360
+    while ang < -180: ang += 360
+    return ang
+
+def _calibrar(amostras=200):
+    gx = gy = gz = 0
+    for _ in range(amostras):
+        gx += _mpu_read_word(GYRO_XOUT_H)
+        gy += _mpu_read_word(GYRO_XOUT_H + 2)
+        gz += _mpu_read_word(GYRO_XOUT_H + 4)
+        time.sleep(0.005)
+    gyro_offset["X"] = gx / amostras
+    gyro_offset["Y"] = gy / amostras
+    gyro_offset["Z"] = gz / amostras
+
+def resetar_giroscopio():
+    global ang_gyro, gyro_ultimo_tempo
+    with _gyro_lock:
+        ang_gyro = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+        gyro_ultimo_tempo = time.time()
+
+def angulo_x(): return int(ang_gyro["X"])
+def angulo_y(): return angulo_y_estavel()
+def angulo_z(): return int(ang_gyro["Z"])
+
+def _gyro_thread():
+    global ang_gyro, gyro_ultimo_tempo
+    while True:
+        try:
+            now = time.time()
+            with _gyro_lock:
+                dt = now - gyro_ultimo_tempo
+                gyro_ultimo_tempo = now
+            if dt > 0.5:
+                time.sleep(0.005)
+                continue
+            gx = (_mpu_read_word(GYRO_XOUT_H)     - gyro_offset["X"]) / 131.0
+            gy = (_mpu_read_word(GYRO_XOUT_H + 2) - gyro_offset["Y"]) / 131.0
+            gz = (_mpu_read_word(GYRO_XOUT_H + 4) - gyro_offset["Z"]) / 131.0
+            with _gyro_lock:
+                ang_gyro["X"] = _normalizar(ang_gyro["X"] + gx * dt)
+                ang_gyro["Y"] = _normalizar(ang_gyro["Y"] + gy * dt)
+                ang_gyro["Z"] = _normalizar(ang_gyro["Z"] + gz * dt)
+        except OSError as e:
+            print(f"[MPU] Gyro I2C: {e}")
+            time.sleep(0.005)
+
+        except Exception as e:
+            print(f"[MPU] Gyro: {e}")
+            time.sleep(0.005)
+
+def iniciar_mpu():
+    _mpu_write(0x6B, 0x00)
+    time.sleep(0.05)
+    _mpu_write(0x1B, 0x00)
+    time.sleep(0.05)
+    print("[MPU6050] Calibrando...")
+    _calibrar()
+    resetar_giroscopio()
+    print("[MPU6050] Pronto")
+    Thread(target=_gyro_thread, daemon=True).start()
+
+ACCEL_XOUT_H = 0x3B
+ACCEL_YOUT_H = 0x3D
+ACCEL_ZOUT_H = 0x3F
+
+_angulo_y_filtrado = None
+
+def angulo_y_estavel(alpha=0.97):
+    global _angulo_y_filtrado
+
+    try:
+        ax = _mpu_read_word(ACCEL_XOUT_H) / 16384.0
+        ay = _mpu_read_word(ACCEL_YOUT_H) / 16384.0
+        az = _mpu_read_word(ACCEL_ZOUT_H) / 16384.0
+
+        angulo = math.degrees(
+            math.atan2(-ax, math.sqrt(ay * ay + az * az))
+        )
+
+        if _angulo_y_filtrado is None:
+            _angulo_y_filtrado = angulo
+        else:
+            _angulo_y_filtrado = (
+                alpha * _angulo_y_filtrado
+                + (1 - alpha) * angulo
+            )
+
+    except OSError as e:
+        print(f"[MPU] Falha I2C ({e}), mantendo último valor.")
+        # NÃO derruba o programa
+
+    if _angulo_y_filtrado is None:
+        return 0
+
+    return int(_angulo_y_filtrado)
+
+
+def guinada_pid(LADO, GRAUS, VEL_MAX_GIRO=100, VEL_MIN_GIRO=29, ZONA_CHEGADA=10):
+    parar_motores()
+    Kp_g, Ki_g, Kd_g = 0.09, 0.002, 0.001
+    resetar_giroscopio()
+    time.sleep(0.03)
+
+    alvo = abs(GRAUS)
+    integral = 0.0
+    erro_ant = alvo
+    t_ant = time.time()
+
+    while True:
+        print("angulo z", angulo_z())
+        checar_parada()
+        atual = abs(angulo_z())
+        erro = alvo - atual
+        agora = time.time()
+        dt = max(agora - t_ant, 0.001)
+
+        if erro <= ZONA_CHEGADA:
+            if LADO == 'D':
+                mover(-15, 15)
+            else:
+                mover(15, -15)
+            time.sleep(0.09)
+            parar_motores()
+            break
+
+        integral += erro * dt
+        integral = np.clip(integral, -20, 20)
+        derivada = (erro - erro_ant) / dt
+        derivada = np.clip(derivada, -300, 300)
+
+        ajuste = Kp_g * erro + Ki_g * integral - Kd_g * derivada
+        ajuste = np.clip(ajuste, 0, VEL_MAX_GIRO - VEL_MIN_GIRO)
+        vel = int(VEL_MIN_GIRO + ajuste)
+
+        if LADO == 'D':
+            mover(vel, -vel)
+        else:
+            mover(-vel, vel)
+
+        erro_ant = erro
+        t_ant = agora
+        time.sleep(0.005)
+
 
 h = lgpio.gpiochip_open(0)
 
 lgpio.gpio_claim_output(h, PINO_SG90)
 lgpio.gpio_claim_output(h, PINO_PESADO)
+GPIO.gpio_claim_input(h, BUTTON, GPIO.SET_PULL_UP)
 
 _angulo_atual = {
     PINO_SG90: ANGULO_INICIAL,
@@ -141,6 +533,165 @@ def turn_left(speed=30):
 def turn_right(speed=30):
     mover(speed, -speed)
 
+
+def buscar_bola():
+    """
+    Gira no lugar até achar qualquer bola (usado só na busca final,
+    depois da 3ª entrega). Retorna True se achou.
+    """
+    for _ in range(BUSCA_FINAL_MAX_GIROS):
+        checar_parada()
+        turn_right(speed=55)
+        time.sleep(TURN_PULSE)
+        parar_motores()
+        time.sleep(0.25)
+
+        crop = capturar_crop()
+        if crop is None:
+            continue
+
+        cx, area, bbox, cls_id = detectar_bola(crop)
+        if cx is not None:
+            return True
+    return False
+
+
+def guinada2(LADO, GRAUS, VELOCIDADE):
+    resetar_giroscopio()
+    time.sleep(0.1)
+    Graus = abs(GRAUS - 13)
+    if LADO == 'D':
+        while True:
+            checar_parada()
+            mover(VELOCIDADE, -VELOCIDADE)
+            if angulo_z() <= -Graus:
+                mover(-10, 10)
+                time.sleep(0.09)
+                break
+            time.sleep(0.005)
+    else:
+        while True:
+            checar_parada()
+            mover(-VELOCIDADE, VELOCIDADE)
+            if angulo_z() >= Graus:
+                mover(10, -10)
+                time.sleep(0.09)
+                break
+            time.sleep(0.005)
+
+
+def detectar_linha_embaixo(frame):
+    """
+    Mesma logica de deteccao de linha do seguidor (threshold + contorno
+    preto), so que aplicada na camera de baixo. Retorna True se achou um
+    contorno preto grande o suficiente pra ser considerado "a linha".
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(gray, LIMIAR_LINHA, 255, cv2.THRESH_BINARY_INV)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_linha)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return False
+
+    maior = max(contours, key=cv2.contourArea)
+    return cv2.contourArea(maior) >= AREA_MIN_LINHA
+
+
+def acionar_saida():
+    """
+    Anda pra frente a VEL_SAIDA ate se deparar com QUALQUER um destes casos:
+      1) TRIANGULO       - camera da frente (a mesma que ve bola/entrega)
+      2) LINHA           - contorno preto na camera de baixo (chao)
+      3) LATERAL_ABERTA  - muita distancia no ultrassonico lateral (saiu
+                            de perto de parede, campo aberto)
+      4) PAREDE_FRENTE   - pouca distancia no ultrassonico da frente
+                            (bateu numa parede)
+    Para assim que identifica o primeiro caso e retorna uma string dizendo
+    qual foi.
+    """
+    print("[SAIDA] saindo, andando ate achar triangulo/linha/parede...")
+    while True:
+        checar_parada()
+        mover(24, 24)
+
+        # 1) TRIANGULO - camera da frente
+        crop = capturar_crop()
+        if crop is not None:
+            cx_tri, area_tri, info_tri = detectar_entrega(crop)
+            if cx_tri is not None:
+                ratio = area_tri / (CROP_W * CROP_H)
+
+                if ratio < 0.30:
+                    continue
+                crop_area = CROP_W * CROP_H
+
+                print(f"Área do triângulo: {ratio:.2f}")
+                print(f"[SAIDA] Triangulo detectado (cor={info_tri['cor']})")
+                # Enquanto o triângulo ainda estiver pequeno, continua avançando
+                while ratio < 0.80:
+                    checar_parada()
+
+                    mover(30, 30)
+                    time.sleep(0.18)
+                    parar_motores()
+
+                    crop = capturar_crop()
+                    if crop is None:
+                        break
+
+                    cx_tri, area_tri, info_tri = detectar_entrega(crop)
+                    if cx_tri is None:
+                        break
+
+                    ratio = area_tri / crop_area
+                    print(f"Área do triângulo: {ratio:.2f}")
+
+                parar_motores()
+                print("guinadinha")      
+                guinada_pid("D", 50)
+                mover(30,30)
+                time.sleep(1.2)
+                mover(-10,-10)       
+                time.sleep(0.09) 
+                mover(25, 0)
+                time.sleep(0.3)
+                mover(0, 25)
+                time.sleep(0.3)
+                guinada_pid("D", 50)
+                mover(-10,-10)       
+                time.sleep(0.09)        
+                
+
+        # 2) LINHA - camera de baixo
+        if cap_linha is not None:
+            ret_l, frame_l = cap_linha.read()
+            if ret_l and frame_l is not None and detectar_linha_embaixo(frame_l):
+                parar_motores()
+                print("[SAIDA] Linha preta detectada na camera de baixo")
+                return "LINHA"
+
+        # 3) LATERAL_ABERTA - ultrassonico lateral
+        if sonar_valido() and distancia_esquerda() >= DIST_LATERAL_ABERTA_CM:
+            print(f"[SAIDA] Muita distancia no lateral ({distancia_esquerda():.1f}cm)")
+            parar_motores()
+            mover(30,30)
+            time.sleep(0.2)
+            guinada_pid("E", 90)
+            mover(30,30)
+            time.sleep(0.2)
+            return "LATERAL_ABERTA"
+
+        # 4) PAREDE_FRENTE - ultrassonico da frente
+        if sonar_valido() and distancia_frente() <= DIST_PAREDE_FRENTE_CM:
+            parar_motores()
+            guinada_pid("D", 90)
+            print(f"[SAIDA] Parede na frente ({distancia_frente():.1f}cm)")
+            
+
+        time.sleep(0.03)
+
+
 def _mascara_cor_tri(hsv, cor):
     if cor == "verde":
         mask = cv2.inRange(hsv, green_min, green_max)
@@ -166,11 +717,11 @@ def desenhar_deteccoes_tri(frame, deteccoes):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, cor_bgr, 1)
     return saida
 
-def _eh_triangulo(contorno):
+def _eh_triangulo(contorno, encostando_borda=False):
     print("ENTROU _eh_triangulo")
     area = cv2.contourArea(contorno)
-    if area < _area_min_tri_ativo or area > AREA_MAX_TRI:
-        print(f"REJEITOU AREA (area={area:.0f}, limiar_atual={_area_min_tri_ativo})")
+    if area < AREA_MIN_TRI or area > AREA_MAX_TRI:
+        print("REJEITOU AREA")
         return False, None
 
     perimetro = cv2.arcLength(contorno, True)
@@ -178,23 +729,30 @@ def _eh_triangulo(contorno):
 
     print("Vertices internos:", len(aproximado))
 
-    if len(aproximado) < 3 or len(aproximado) > 4:
+    # Se o contorno está encostando na borda do crop, o polígono real
+    # foi cortado pela imagem -- é normal ter menos vértices quando
+    # estamos muito perto. Nesse caso aceitamos a partir de 2 vértices.
+    min_vertices = 2 if encostando_borda else 3
+    if len(aproximado) < min_vertices or len(aproximado) > 4:
         print("REJEITOU VERTICES")
         return False, None
 
-    if not cv2.isContourConvex(aproximado):
+    # Convexidade só faz sentido checar quando o polígono não foi
+    # cortado pela borda (senão vira côncavo naturalmente e não é bug).
+    if not encostando_borda and not cv2.isContourConvex(aproximado):
         print("REJEITOU CONVEX")
         return False, None
 
     print("ACEITOU")
 
-
-    rect = cv2.minAreaRect(contorno)
-    (cx, cy), (w, h), angulo = rect
-    largura, altura = max(w, h), min(w, h)
-    if altura == 0:
+    # Centroide real da área visível (média dos pixels do contorno),
+    # em vez do centro do bounding rect -- evita que o centro fique
+    # puxado pra ponta quando a câmera só enxerga parte do retângulo.
+    M = cv2.moments(contorno)
+    if M["m00"] == 0:
         return False, None
-
+    cx = M["m10"] / M["m00"]
+    cy = M["m01"] / M["m00"]
 
     return True, {
         "centro": (int(cx), int(cy)),
@@ -202,7 +760,6 @@ def _eh_triangulo(contorno):
         "cor": None,
         "vertices": aproximado.reshape(-1, 2),
     }
-
 
 def detectar_entrega(crop):
     """
@@ -225,7 +782,7 @@ def detectar_entrega(crop):
             mask_verde = mask
         else:
             mask_vermelho = mask
-    
+
         contornos, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         print(f"Quantidade de contornos: {len(contornos)}")
         for c in contornos:
@@ -234,8 +791,17 @@ def detectar_entrega(crop):
             approx = cv2.approxPolyDP(c, 0.04 * peri, True)
 
             print(f"Area={area:.1f}  Vertices={len(approx)}")
+
+            x, y, w, h_bb = cv2.boundingRect(c)
+            margem = 2
+            encostando_borda = (
+                x <= margem or y <= margem or
+                x + w >= crop.shape[1] - margem or
+                y + h_bb >= crop.shape[0] - margem
+            )
+
             print("Chamando _eh_triangulo")
-            ok, info = _eh_triangulo(c)
+            ok, info = _eh_triangulo(c, encostando_borda=encostando_borda)
             print("Resultado:", ok)
             if ok:
                 info["cor"] = cor
@@ -263,7 +829,8 @@ def centralizar_triangulo():
     """Igual centralizar_bola(), mas usando detectar_entrega()."""
     print(f"🔎 [centralizar_triangulo] ALVO_COR ativo = {ALVO_COR!r}")
     perdida = 0
-    for _ in range(CENTER_MAX_TENTATIVAS):
+    for _ in range(TRIANGULO_CENTER_MAX_TENTATIVAS):
+        checar_parada()
         crop = capturar_crop()
         if crop is None:
             parar_motores()
@@ -276,7 +843,7 @@ def centralizar_triangulo():
 
         if cx is None:
             perdida += 1
-            if perdida >= CENTER_LOST_FRAMES:
+            if perdida >= TRIANGULO_CENTER_LOST_FRAMES:
                 print("❌ Perdeu o triângulo durante centralização")
                 parar_motores()
                 return False
@@ -314,7 +881,8 @@ def aproximar_triangulo():
     crop_area = CROP_W * CROP_H
     perdida = 0
 
-    for passo in range(MAX_APPROACH_STEPS):
+    for passo in range(TRIANGULO_MAX_APPROACH_STEPS):
+        checar_parada()
         crop = capturar_crop()
         if crop is None:
             parar_motores()
@@ -346,8 +914,8 @@ def aproximar_triangulo():
                 return False
             continue
 
-        forward(speed=APPROACH_SPEED)
-        time.sleep(APPROACH_STEP_TIME)
+        forward(speed=TRIANGULO_APPROACH_SPEED)
+        time.sleep(TRIANGULO_APPROACH_STEP_TIME)
         parar_motores()
         time.sleep(0.05)
 
@@ -359,6 +927,7 @@ def buscar_triangulo():
     """Gira no lugar até achar um triângulo. Retorna True se achou."""
     print(f"🔎 [buscar_triangulo] ALVO_COR ativo = {ALVO_COR!r}")
     for _ in range(TRIANGULO_MAX_GIROS):
+        checar_parada()
         crop = capturar_crop()
         if crop is not None:
             cx, area, info = detectar_entrega(crop)
@@ -379,80 +948,129 @@ def entregar_bola(cor_alvo=None):
 
     cor_alvo: "vermelho" ou "verde". Se None, aceita qualquer triângulo
     (comportamento antigo, sem diferenciação por classe).
-
-    Durante a entrega, o limiar de área mínima do triângulo (AREA_MIN_TRI)
-    sobe pra AREA_MIN_TRI_BUSCA, pra ignorar retalhos/manchas coloridas
-    pequenas fora da área de resgate. No final (sucesso ou falha), o
-    limiar volta pro valor normal automaticamente.
     """
-    global ALVO_COR, _area_min_tri_ativo
+    global ALVO_COR
     ALVO_COR = cor_alvo
-    _area_min_tri_ativo = AREA_MIN_TRI_BUSCA
 
-    try:
-        parar_motores()
-        time.sleep(0.5)
+    checar_parada()
+    parar_motores()
+    time.sleep(0.5)
 
-        for _ in range(8):
-            cap.read()
+    for _ in range(8):
+        cap.read()
 
-        if cor_alvo:
-            print(f"🔺 Procurando área de entrega {cor_alvo.upper()}...")
-        else:
-            print("🔺 Procurando área de entrega (qualquer cor)...")
+    if cor_alvo:
+        print(f"🔺 Procurando área de entrega {cor_alvo.upper()}...")
+    else:
+        print("🔺 Procurando área de entrega (qualquer cor)...")
 
-        if not buscar_triangulo():
-            print("❌ Não achou nenhum triângulo, abortando entrega")
-            return False
-
-        if not centralizar_triangulo():
-            print("❌ Não conseguiu centralizar no triângulo")
-            return False
-
-        print("⬆️ Centralizado no triângulo → aproximando")
-        if not aproximar_triangulo():
-            print("❌ Não conseguiu se aproximar do triângulo")
-            return False
-
-        print("📤 Soltando a bola...")
-        mover(30,30)
-        time.sleep(2.5)
-        mover_servo_direto(PINO_SG90, 150)
-        mover_servo(PINO_PESADO, 120, velocidade=10)
-        oscilar_servo_rapido(PINO_PESADO, angulo_a=30, angulo_b=120, repeticoes=20, delay=0.1)
-        print("✅ Bola entregue")
-        return True
-    finally:
-        # Sempre volta ao normal, independente de sucesso, falha ou exceção
+    if not buscar_triangulo():
+        print("❌ Não achou nenhum triângulo, abortando entrega")
         ALVO_COR = None
-        _area_min_tri_ativo = AREA_MIN_TRI
+        return False
+
+    if not centralizar_triangulo():
+        print("❌ Não conseguiu centralizar no triângulo")
+        ALVO_COR = None
+        return False
+
+    print("⬆️ Centralizado no triângulo → aproximando")
+    if not aproximar_triangulo():
+        print("❌ Não conseguiu se aproximar do triângulo")
+        ALVO_COR = None
+        return False
+
+    print("📤 Soltando a bola...")
+    print("⬆️ Centralizado no triângulo → aproximando")
+    if not aproximar_triangulo():
+        print("❌ Não conseguiu se aproximar do triângulo")
+        ALVO_COR = None
+        return False
+
+    # Recentraliza uma última vez, já perto, pra garantir que a bola
+    # caia no MEIO do retângulo e não na ponta.
+    checar_parada()
+    print("🎯 Recentralizando antes de soltar...")
+    if not centralizar_triangulo():
+        print("❌ Perdeu o triângulo na recentralização final")
+        ALVO_COR = None
+        return False
+    
+    print("🎯 Recentralizando antes de soltar...")
+    if not centralizar_triangulo():
+        print("❌ Perdeu o triângulo na recentralização final")
+        ALVO_COR = None
+        return False
+
+    checar_parada()
+    verificar_e_afastar_bola_bloqueio()   # <-- checa e afasta bola do canto, se houver
+
+    checar_parada()
+    print("📤 Soltando a bola...")
+    mover(40,40)
+    time.sleep(1.5)
+    parar_motores()          # <-- adiciona os parênteses
+    angulo(170)
+    oscilar_servo_rapido(PINO_PESADO, angulo_a=35, angulo_b=50, repeticoes=10, delay=0.1)
+    mover_servo(PINO_PESADO, 150, velocidade=50)
+    time.sleep(0.5)
+    mover_servo(PINO_PESADO, 140, velocidade=50)
+    time.sleep(0.5)
+    mover(-30,-30)
+    time.sleep(1.0)
+    parar_motores()          # <-- adiciona essa também, no final da ré
+    parar_servo(PINO_PESADO)
+    parar_servo(PINO_SG90)
+    print("✅ Bola entregue")
+    ALVO_COR = None
+    return True    
 
 def mover_servo(pino, angulo, velocidade=100, pulso_min=500, pulso_max=2500):
-    """Move suave, passo a passo (usa a velocidade pra controlar o delay)."""
     angulo = max(0, min(180, angulo))
     velocidade = max(1, min(100, velocidade))
 
     angulo_atual = _angulo_atual.get(pino, ANGULO_INICIAL)
     delay_por_passo = DELAY_BASE * (100 - velocidade) / 100.0
 
-    passo = 1 if angulo >= angulo_atual else -1
+    passo = 2 if angulo > angulo_atual else -2
 
-    for ang in range(int(angulo_atual), int(angulo) + passo, passo):
+    for ang in range(int(angulo_atual), int(angulo), passo):
+        checar_parada()
         largura_pulso = pulso_min + (ang / 180.0) * (pulso_max - pulso_min)
-        lgpio.tx_servo(h, pino, int(largura_pulso))
+        try:
+            lgpio.tx_servo(h, pino, int(largura_pulso))
+        except lgpio.error as e:
+            print(f"⚠️ Falha ao mover servo (pino={pino}, pulso={largura_pulso:.0f}): {e}")
+            continue
         if delay_por_passo > 0:
             time.sleep(delay_por_passo)
 
     _angulo_atual[pino] = angulo
-    time.sleep(0.15)
+    time.sleep(0.8)
 
+    try:
+        lgpio.tx_servo(h, pino, 0)
+    except lgpio.error as e:
+        print(f"⚠️ Falha ao desligar PWM do servo (pino={pino}): {e}")
+
+def angulo(ang):
+    ang = max(0, min(180, ang))
+
+    # 500 us -> 0
+    # 2500 us -> 180
+    pulso = int(500 + (2000 * ang / 180))
+
+    print("Pulso:", pulso)
+
+    lgpio.tx_servo(h, PINO_SG90, pulso)
 
 def mover_servo_direto(pino, angulo, pulso_min=500, pulso_max=2500):
-    """Manda o pulso direto pro ângulo, sem passar por passos intermediários."""
     angulo = max(0, min(180, angulo))
     largura_pulso = pulso_min + (angulo / 180.0) * (pulso_max - pulso_min)
     lgpio.tx_servo(h, pino, int(largura_pulso))
-    _angulo_atual[pino] = angulo
+    time.sleep(0.15)
+    parar_servo(pino)
+    _angulo_atual[pino] = angulo 
 
 
 def oscilar_servo_rapido(pino, angulo_a, angulo_b, repeticoes=1, delay=0.15):
@@ -462,6 +1080,7 @@ def oscilar_servo_rapido(pino, angulo_a, angulo_b, repeticoes=1, delay=0.15):
     ponta pra dar tempo do servo fisicamente chegar lá antes de inverter.
     """
     for i in range(repeticoes):
+        checar_parada()
         mover_servo_direto(pino, angulo_a)
         time.sleep(delay)
         mover_servo_direto(pino, angulo_b)
@@ -493,6 +1112,7 @@ def centralizar_bola():
     """
     perdida = 0
     for _ in range(CENTER_MAX_TENTATIVAS):
+        checar_parada()
         crop = capturar_crop()
         if crop is None:
             parar_motores()
@@ -553,10 +1173,11 @@ def detectar_bola(crop):
     cv2.waitKey(1)
 
     if boxes is not None and len(boxes) > 0:
-        x1, y1, x2, y2 = map(int, boxes.xyxy[0].tolist())
+        idx = escolher_indice_mais_perto(boxes)
+        x1, y1, x2, y2 = map(int, boxes.xyxy[idx].tolist())
         cx = (x1 + x2) // 2
         area = (x2 - x1) * (y2 - y1)
-        cls_id = int(boxes.cls[0].item()) if getattr(boxes, "cls", None) is not None else None
+        cls_id = int(boxes.cls[idx].item()) if getattr(boxes, "cls", None) is not None else None
         return cx, area, (x1, y1, x2, y2), cls_id
 
     return None, None, None, None
@@ -575,6 +1196,7 @@ def aproximar_bola():
     perdida = 0
 
     for passo in range(MAX_APPROACH_STEPS):
+        checar_parada()
         crop = capturar_crop()
         if crop is None:
             print("❌ Erro na câmera durante aproximação")
@@ -629,6 +1251,58 @@ def center_crop(frame, crop_w, crop_h):
     x2, y2 = x1 + crop_w, y1 + crop_h
     return frame[y1:y2, x1:x2].copy()
 
+def escolher_indice_mais_perto(boxes):
+    """
+    Quando o YOLO detecta mais de uma bola no mesmo frame, escolhe a
+    de MAIOR área de bbox (ou seja, a mais perto da câmera) e ignora
+    as outras nesse ciclo, pra não ficar indeciso sobre qual perseguir.
+    """
+    if boxes is None or len(boxes) == 0:
+        return None
+    maior_area = -1
+    melhor_idx = 0
+    for i in range(len(boxes)):
+        x1, y1, x2, y2 = map(int, boxes.xyxy[i].tolist())
+        area = (x2 - x1) * (y2 - y1)
+        if area > maior_area:
+            maior_area = area
+            melhor_idx = i
+    return melhor_idx
+
+def verificar_e_afastar_bola_bloqueio():
+    """
+    Verifica, usando o modelo YOLO (mesma detecção que já usamos pra
+    achar bola normalmente), se tem alguma bola bloqueando o canto/
+    triângulo de entrega. Se tiver, chama o movimento de afastar antes
+    de soltar a bola que estamos carregando -- senão ela pode empurrar
+    ou trombar na bola que já tá lá.
+    """
+    crop = capturar_crop()
+    if crop is None:
+        return
+
+    cx, area, bbox, cls_id = detectar_bola(crop)
+    if cx is not None:
+        print("⚠️ Bola bloqueando a área de entrega, afastando...")
+        afastar_bola_do_canto()
+
+
+def afastar_bola_do_canto():
+    '''checar_parada()
+    mover(-30, -30)
+    time.sleep(0.5)
+    mover_servo(PINO_PESADO, 5, velocidade=10)
+    mover(30, 30)
+    time.sleep(0.6)
+    mover(-30, 30)
+    time.sleep(0.2)
+    mover(30, -30)
+    time.sleep(0.4)
+    mover(-30, 30)
+    time.sleep(0.4)
+    mover(30, -30)
+    time.sleep(0.2)'''
+    pass    
 
 # ===================== SETUP CÂMERA E MODELO =====================
 cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
@@ -638,6 +1312,26 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 if not cap.isOpened():
     print(f"❌ Não consegui abrir a câmera de resgate em {CAMERA_INDEX}")
     exit(1)
+
+# Camera de baixo (chao) - so usada dentro de acionar_saida() pra ver a
+# linha preta. Se nao abrir, acionar_saida() simplesmente ignora esse
+# criterio e segue com triangulo/ultrassonico.
+cap_linha = cv2.VideoCapture(CAMERA_INDEX_LINHA, cv2.CAP_V4L2)
+if not cap_linha.isOpened():
+    print(f"⚠️ Não consegui abrir a câmera de baixo em {CAMERA_INDEX_LINHA}, tentando fallback...")
+    cap_linha.release()
+    cap_linha = cv2.VideoCapture(CAMERA_LINHA_INDEX_FALLBACK, cv2.CAP_V4L2)
+if cap_linha.isOpened():
+    cap_linha.set(cv2.CAP_PROP_FRAME_WIDTH, LINHA_W)
+    cap_linha.set(cv2.CAP_PROP_FRAME_HEIGHT, LINHA_H)
+    cap_linha.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+else:
+    print("⚠️ Câmera de baixo indisponível, acionar_saida() vai rodar sem detecção de linha")
+    cap_linha = None
+t_mpu = Thread(target=iniciar_mpu)
+t_mpu.start()
+# Sonar (serial) - usado em acionar_saida() pra parede/lateral aberta
+iniciar_serial()
 
 model = YOLO(MODEL_PATH)
 print("📋 Classes do modelo:", model.names)
@@ -659,98 +1353,157 @@ for _cls_id, _nome in model.names.items():
 print("🎯 Mapeamento classe -> cor de entrega:", CLASSE_COR_ENTREGA)
 cv2.namedWindow("Detecção", cv2.WINDOW_NORMAL)
 mover_servo(PINO_PESADO, 150, velocidade=100)
+entregas_realizadas = 0
+
+# Sobe a thread do botão antes do loop principal, igual no seguidor_debug2.py
+threading.Thread(target=botao_thread, daemon=True).start()
+
 # ===================== LOOP PRINCIPAL =====================
 try:
     print("🚗 Iniciando busca por bolas...")
     while True:
-        turn_right(speed=55)
-        time.sleep(TURN_PULSE)
+        try:
+            checar_parada()
+            '''turn_right(speed=55)
+            time.sleep(TURN_PULSE)
 
-        parar_motores()
+            parar_motores()
 
-        # Espera a vibração parar
-        time.sleep(0.25)
+            # Espera a vibração parar
+            time.sleep(0.25)
 
-        # Descarta alguns frames antigos da câmera
-        for _ in range(4):
-            cap.read()
+            # Descarta alguns frames antigos da câmera
+            for _ in range(4):
+                cap.read()
 
-        # Captura um frame atualizado
-        ret, frame = cap.read()
-        if not ret:
-            print("❌ Erro na câmera")
-            break
-        crop = center_crop(frame, CROP_W, CROP_H)
-        inicio = time.perf_counter()
-        results = model.predict(
-            crop,
-            imgsz=(320, 256),
-            conf=CONF_THRES,
-            verbose=False,
-            show=False
-        )
-        print((time.perf_counter() - inicio) * 1000)
-        r = results[0]
-        boxes = getattr(r, "boxes", None)
+            # Captura um frame atualizado
+            ret, frame = cap.read()
+            if not ret:
+                print("❌ Erro na câmera")
+                break
+            crop = center_crop(frame, CROP_W, CROP_H)
+            inicio = time.perf_counter()
+            results = model.predict(
+                crop,
+                imgsz=(320, 256),
+                conf=CONF_THRES,
+                verbose=False,
+                show=False
+            )
+            print((time.perf_counter() - inicio) * 1000)
+            r = results[0]
+            boxes = getattr(r, "boxes", None)
 
-        # SEMPRE mostra a tela, com ou sem deteccao (r.plot() desenha as
-        # caixas se houver, ou so a imagem crua se nao houver nada)
-        annotated = r.plot()
-        cv2.imshow("Detecção", annotated)
-        
+            # SEMPRE mostra a tela, com ou sem deteccao (r.plot() desenha as
+            # caixas se houver, ou so a imagem crua se nao houver nada)
+            annotated = r.plot()
+            cv2.imshow("Detecção", annotated)
+            
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
-        if boxes is not None and len(boxes) > 0:
-            xyxy = boxes.xyxy[0].tolist()
-            x1, y1, x2, y2 = map(int, xyxy)
-            cx = (x1 + x2) // 2
-            cls_id = int(boxes.cls[0].item()) if getattr(boxes, "cls", None) is not None else None
-            nome_classe = model.names.get(cls_id, "desconhecida") if cls_id is not None else "desconhecida"
-            print(f"🎯 Bola detectada em cx={cx} | classe={cls_id} ({nome_classe})")
+            if boxes is not None and len(boxes) > 0:
+                idx = escolher_indice_mais_perto(boxes)
+                xyxy = boxes.xyxy[idx].tolist()
+                x1, y1, x2, y2 = map(int, xyxy)
+                cx = (x1 + x2) // 2
+                cls_id = int(boxes.cls[idx].item()) if getattr(boxes, "cls", None) is not None else None
+                nome_classe = model.names.get(cls_id, "desconhecida") if cls_id is not None else "desconhecida"
+                print(f"🎯 Bola detectada em cx={cx} | classe={cls_id} ({nome_classe})")
 
-            if abs(cx - IMG_CENTER_X) > TOLERANCE:
-                if not centralizar_bola():
-                    print("🔄 Não conseguiu centralizar, voltando pra busca")
+                if abs(cx - IMG_CENTER_X) > TOLERANCE:
+                    if not centralizar_bola():
+                        print("🔄 Não conseguiu centralizar, voltando pra busca")
+                        continue
+
+                print("⬆️ Centralizado → avançando")
+                if not aproximar_bola():
+                    print("🔄 Não conseguiu se aproximar, voltando pra busca")
                     continue
 
-            print("⬆️ Centralizado → avançando")
-            if not aproximar_bola():
-                print("🔄 Não conseguiu se aproximar, voltando pra busca")
-                continue
+                print("🦾 Fechando garra na bola")
+                checar_parada()
+                mover(-10,-10)
+                time.sleep(0.09)
+                parar_motores()
+                mover_servo(PINO_PESADO, 40, velocidade=10)
+                angulo(0)
+                mover(-30,-30)
+                time.sleep(0.1)
+                parar_motores()
+                mover(30,30)
+                time.sleep(0.5)
+                parar_motores()
+                mover(-10,-10)
+                time.sleep(0.09)
+                parar_motores()
+                mover_servo(PINO_PESADO, 0, velocidade=5)
+                mover(30,30)
+                time.sleep(0.5)
+                parar_motores()
+                mover(-30,-30)
+                time.sleep(0.5)
+                parar_motores()
+                mover(30,30)
+                time.sleep(0.1)
+                parar_motores()
+                mover(-30,-30)
+                time.sleep(0.1)
+                parar_motores()
+                mover(-10,-10)
+                time.sleep(0.09)
+                parar_motores()
+                mover_servo(PINO_PESADO, 150, velocidade=5)
+                mover(-50,-50)
+                time.sleep(0.3)
+                parar_motores()
+                cor_alvo = CLASSE_COR_ENTREGA.get(cls_id)
+                if cor_alvo is None:
+                    print(f"⚠️ Classe {cls_id} não mapeada em CLASSE_COR_ENTREGA, entregando em qualquer área")
+                entregar_bola(cor_alvo)
+                entregas_realizadas += 1
 
-            print("🦾 Fechando garra na bola")
-            mover(30,30)
-            time.sleep(0.1)
-            mover(-10,-10)
-            time.sleep(0.09)
-            mover_servo(PINO_PESADO, 50, velocidade=10)
-            mover_servo_direto(PINO_SG90,150)
-            mover(-30,-30)
-            time.sleep(0.2)
-            mover(30,30)
-            time.sleep(0.5)
-            mover(-10,-10)
-            time.sleep(0.09)
-            mover_servo(PINO_PESADO, 0, velocidade=5)
-            mover(30,30)
-            time.sleep(0.5)
-            mover(-30,-30)
-            time.sleep(0.2)
-            mover(-10,-10)
-            time.sleep(0.09)
-            mover_servo_direto(PINO_SG90,0)
-            mover_servo(PINO_PESADO, 150, velocidade=5)
+                if entregas_realizadas >= MAX_ENTREGAS:
+                    print("🏁 3 entregas concluídas, fazendo busca final...")
+                    if not buscar_bola():
+                        print("🚪 Nenhuma bola na busca final, acionando saída")
+                        caso_saida = acionar_saida()
+                        print(f"[SAIDA] Caso identificado: {caso_saida}")
+                        parar_motores()
+                        cap.release()
+                        if cap_linha is not None:
+                            cap_linha.release()
+                        GPIO.gpiochip_close(h)
+                        os.execv(sys.executable, [sys.executable, "/home/pi/ROBO_DOGO_2026/codes_rasp/PROTOTIPAGEM_LINE/seguidor_debug2.py"])
+                        break
+                    else:
+                        print("🎯 Achou mais uma bola na busca final, continuando normalmente")
+                        # deixa o loop seguir e a próxima iteração já detecta e pega essa bola
 
-            # Define pra qual cor de área entregar, baseado na classe da bola pega
-            cor_alvo = CLASSE_COR_ENTREGA.get(cls_id)
-            if cor_alvo is None:
-                print(f"⚠️ Classe {cls_id} não mapeada em CLASSE_COR_ENTREGA, entregando em qualquer área")
-            entregar_bola(cor_alvo)
-
-        else:
-            print("🔄 Nenhuma bola — novo passo de giro")
+            else:
+                print("🔄 Nenhuma bola — novo passo de giro")'''
+            acionar_saida()
+            caso_saida = acionar_saida()
+            print(f"[SAIDA] Caso identificado: {caso_saida}")
+            parar_motores()
+            cap.release()
+            if cap_linha is not None:
+                cap_linha.release()
+            GPIO.gpiochip_close(h)
+            os.execv(sys.executable, [sys.executable, "/home/pi/ROBO_DOGO_2026/codes_rasp/PROTOTIPAGEM_LINE/seguidor_debug2.py"])
+            print("angulo z", angulo_z())
+        except RoboParado:
+            print("🛑 Robo parado pelo botao,voltando pro seguidor...")
+            parar_motores()
+            cap.release()
+            if cap_linha is not None:
+                cap_linha.release()
+            GPIO.gpiochip_close(h)
+            os.execv(sys.executable, [sys.executable, "/home/pi/ROBO_DOGO_2026/codes_rasp/PROTOTIPAGEM_LINE/seguidor_debug2.py"])
+            '''robo_ativo.wait()
+            print("▶️ Retomando busca por bolas...")
+            continue'''
 
 except KeyboardInterrupt:
     print("\n🛑 Interrompido pelo usuário.")
@@ -758,5 +1511,7 @@ finally:
     parar_motores()
     GPIO.gpiochip_close(h)
     cap.release()
+    if cap_linha is not None:
+        cap_linha.release()
     cv2.destroyAllWindows()
     print("✔️ Finalizado com segurança.")

@@ -31,13 +31,13 @@ def botao_thread():
     anterior = 0
     while True:
         estado = GPIO.gpio_read(h, BUTTON)
-        if estado == 1 and anterior == 0:
+        if estado == 0 and anterior == 1:
             time.sleep(0.03)
-            if GPIO.gpio_read(h, BUTTON) == 1:
+            if GPIO.gpio_read(h, BUTTON) == 0:
                 if robo_ativo.is_set():
                     robo_ativo.clear()
                     parar_motores()
-                    print("[BOTAO] PAROU (aperte de novo pra reiniciar)")
+                    print("[BOTAO] PAROU")
                 else:
                     print("[BOTAO] REINICIANDO...")
                     robo_ativo.set()
@@ -206,7 +206,9 @@ def buscar_bola():
 
 def acionar_saida():
     print("saindo")
-    
+    while True:
+        mover(30,30)
+
     os.execv(sys.executable, [sys.executable, "/home/pi/ROBO_DOGO_2026/codes_rasp/PROTOTIPAGEM_LINE/seguidor_debug2.py"])
 
 
@@ -860,7 +862,6 @@ threading.Thread(target=botao_thread, daemon=True).start()
 try:
     print("🚗 Iniciando busca por bolas...")
     while True:
-        robo_ativo.wait()  # trava aqui se o botao pausou o robo
         try:
             checar_parada()
             turn_right(speed=55)

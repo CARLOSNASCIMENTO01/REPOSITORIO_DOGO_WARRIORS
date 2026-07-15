@@ -70,7 +70,7 @@ def parar_servo(pino):
 
 try:
 
-    mover_servo(PINO_PESADO, 0, velocidade=10)
+    mover_servo(PINO_PESADO, 150, velocidade=10)
     parar_servo(PINO_PESADO)
 
 finally:
