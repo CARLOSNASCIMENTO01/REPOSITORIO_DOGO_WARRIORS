@@ -230,13 +230,24 @@ gyro_ultimo_tempo = time.time()
 def _mpu_write(reg, val):
     bus.write_byte_data(MPU_ADDR, reg, val)
 
-def _mpu_read_word(reg):
-    hi = bus.read_byte_data(MPU_ADDR, reg)
-    lo = bus.read_byte_data(MPU_ADDR, reg + 1)
-    val = (hi << 8) | lo
-    if val >= 0x8000:
-        val -= 65536
-    return val
+def _mpu_read_word(reg, tentativas=3):
+    for tentativa in range(tentativas):
+        try:
+            hi = bus.read_byte_data(MPU_ADDR, reg)
+            lo = bus.read_byte_data(MPU_ADDR, reg + 1)
+
+            valor = (hi << 8) | lo
+
+            if valor >= 0x8000:
+                valor -= 65536
+
+            return valor
+
+        except OSError as e:
+            # Remote I/O error (121), muito comum em impactos
+            if tentativa == tentativas - 1:
+                raise
+            time.sleep(0.001)
 
 def _normalizar(ang):
     while ang > 180: ang -= 360
@@ -282,9 +293,13 @@ def _gyro_thread():
                 ang_gyro["X"] = _normalizar(ang_gyro["X"] + gx * dt)
                 ang_gyro["Y"] = _normalizar(ang_gyro["Y"] + gy * dt)
                 ang_gyro["Z"] = _normalizar(ang_gyro["Z"] + gz * dt)
-        except Exception:
-            pass
-        time.sleep(0.005)
+        except OSError as e:
+            print(f"[MPU] Gyro I2C: {e}")
+            time.sleep(0.005)
+
+        except Exception as e:
+            print(f"[MPU] Gyro: {e}")
+            time.sleep(0.005)
 
 def iniciar_mpu():
     _mpu_write(0x6B, 0x00)
@@ -319,34 +334,33 @@ ACCEL_ZOUT_H = 0x3F
 _angulo_y_filtrado = None
 
 def angulo_y_estavel(alpha=0.97):
-    """
-    Retorna o �ngulo Y em graus.
-    alpha:
-        0.95 = responde mais r�pido
-        0.97 = recomendado
-        0.99 = muito est�vel
-    """
-
     global _angulo_y_filtrado
 
-    ax = _mpu_read_word(ACCEL_XOUT_H) / 16384.0
-    ay = _mpu_read_word(ACCEL_YOUT_H) / 16384.0
-    az = _mpu_read_word(ACCEL_ZOUT_H) / 16384.0
+    try:
+        ax = _mpu_read_word(ACCEL_XOUT_H) / 16384.0
+        ay = _mpu_read_word(ACCEL_YOUT_H) / 16384.0
+        az = _mpu_read_word(ACCEL_ZOUT_H) / 16384.0
 
-    angulo = math.degrees(
-        math.atan2(-ax, math.sqrt(ay * ay + az * az))
-    )
-
-    if _angulo_y_filtrado is None:
-        _angulo_y_filtrado = angulo
-    else:
-        _angulo_y_filtrado = (
-            alpha * _angulo_y_filtrado +
-            (1 - alpha) * angulo
+        angulo = math.degrees(
+            math.atan2(-ax, math.sqrt(ay * ay + az * az))
         )
 
-    return int(_angulo_y_filtrado)
+        if _angulo_y_filtrado is None:
+            _angulo_y_filtrado = angulo
+        else:
+            _angulo_y_filtrado = (
+                alpha * _angulo_y_filtrado
+                + (1 - alpha) * angulo
+            )
 
+    except OSError as e:
+        print(f"[MPU] Falha I2C ({e}), mantendo último valor.")
+        # NÃO derruba o programa
+
+    if _angulo_y_filtrado is None:
+        return 0
+
+    return int(_angulo_y_filtrado)
 
 
 def detectar_porta(sair_se_falhar=True):
@@ -1344,29 +1358,33 @@ def controle(cx, contours, roi):
     derivada = np.clip(derivada, -300, 300)
     ajuste = (Kp * erro) + (Kd * derivada)
 
-    if -5 < angulo_y() < 5:
+    print("angulo y ",angulo_y())
+    if -5 < angulo_y() < 3 and contador_gangorra != 2:
         contador_gangorra = 0
 
-    if angulo_y() <= -10:
-        velocidade_base = 60
+    
+    if angulo_y() <= -16:
+        contador_gangorra = 2
+        velocidade_base = 45
         velL = np.clip(velocidade_base + ajuste, 20, 100)
         velR = np.clip(velocidade_base - ajuste, 20, 100)
-    elif angulo_y() >= 8 and contador_gangorra == 0:
-        contador_gangorra = 1
-        mover(-10, -10)
-        time.sleep(1.0)
-        mover(-40, -40)
-        time.sleep(0.3)
-        velocidade_base = 20
-        velL = velocidade_base + ajuste
-        velR = velocidade_base - ajuste
     else:
         velocidade_base = VEL_BASE
         velL = np.clip(velocidade_base + ajuste, VEL_MIN, VEL_MAX)
         velR = np.clip(velocidade_base - ajuste, VEL_MIN, VEL_MAX)
-
+    if angulo_y() >= -3 and contador_gangorra == 2:
+        print("descendo gangorra ")
+        contador_gangorra = 1
+        mover(-10, -10)
+        time.sleep(1.0)
+        mover(-40, -40)
+        time.sleep(0.6)
+        velocidade_base = 20
+        velL = velocidade_base + ajuste
+        velR = velocidade_base - ajuste
     mover(velL, velR)
     ultimo_erro = erro
+
     ultimo_tempo = tempo_atual
     return ajuste, contours
 
@@ -1402,7 +1420,10 @@ def loop_principal():
                 falhas_camera_seguidas = 0
             continue
         falhas_camera_seguidas = 0
-
+        #print("ANGULO Y ", angulo_y())
+        #print("ULTRA", distancia_frente())
+       
+            
         if detectar_fita_vermelha(frame):
             continue
 
@@ -1483,22 +1504,21 @@ if __name__ == "__main__":
             try:
                 robo_ativo.wait()
                 loop_principal()
-                #print(angulo_y())
 
-            except RoboParado:
-                parar()
-                print("[SISTEMA] Robo parado. Aguardando novo aperto do botao...")
-                robo_ativo.wait()
+                
+
+            except KeyboardInterrupt:
+                print("Finalizado")
+                break
+
+            except OSError as e:
+                print("[MPU] Erro I2C:", repr(e))
+                time.sleep(0.01)
                 continue
 
             except Exception as e:
-                print("[ERRO] loop principal falh:", repr(e))
+                print("[ERRO] loop principal:", repr(e))
                 parar()
-                time.sleep(0.5)
-                continue
-
-    except KeyboardInterrupt:
-        print("Finalizado")
 
     finally:
         parar()

@@ -2,8 +2,8 @@ import lgpio
 import time
 
 # Pinos
-PINO_SG90 = 20
-PINO_PESADO = 16
+PINO_SG90 = 21
+PINO_PESADO = 20
 
 ANGULO_INICIAL = 90
 
@@ -70,8 +70,8 @@ def parar_servo(pino):
 
 try:
 
-    
-    mover_servo_direto(PINO_SG90,150)
+    mover_servo(PINO_PESADO, 0, velocidade=10)
+    parar_servo(PINO_PESADO)
 
 finally:
     lgpio.gpiochip_close(h)

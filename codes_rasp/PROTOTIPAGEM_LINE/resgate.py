@@ -6,6 +6,45 @@ import lgpio
 import numpy as np
 import sys
 import os
+import threading
+
+# ===================== BOTAO DE PARADA IMEDIATA (mesmo padrao do seguidor_debug2.py) =====================
+BUTTON = 24  # mesmo pino usado no codigo de linha
+
+class RoboParado(Exception):
+    """Levantada quando o botao pede parada, pra abortar QUALQUER loop na hora."""
+    pass
+
+robo_ativo = threading.Event()
+robo_ativo.set()  # comeca ligado
+
+def checar_parada():
+    """Chamar a cada iteracao de todo while/for que segura o robo por mais
+    de um instante (buscas, centralizacao, aproximacao, entrega, etc)."""
+    if not robo_ativo.is_set():
+        raise RoboParado()
+
+def botao_thread():
+    """Toggle com debounce: aperta -> para tudo na hora (mesmo no meio de
+    uma busca/aproximacao/entrega). Aperta de novo -> deixa o robo continuar
+    (retoma a busca por bolas do zero)."""
+    anterior = 0
+    while True:
+        estado = GPIO.gpio_read(h, BUTTON)
+        if estado == 1 and anterior == 0:
+            time.sleep(0.03)
+            if GPIO.gpio_read(h, BUTTON) == 1:
+                if robo_ativo.is_set():
+                    robo_ativo.clear()
+                    parar_motores()
+                    print("[BOTAO] PAROU (aperte de novo pra reiniciar)")
+                else:
+                    print("[BOTAO] REINICIANDO...")
+                    robo_ativo.set()
+                while GPIO.gpio_read(h, BUTTON) == 1:
+                    time.sleep(0.02)
+        anterior = estado
+        time.sleep(0.02)
 
 # ===================== DETECÇÃO DE TRIÂNGULO (área de entrega) =====================
 ALVO_COR = None  # None = aceita verde OU vermelho; setado dinamicamente em entregar_bola()
@@ -41,8 +80,8 @@ STOP_AREA_RATIO_TRIANGULO = 0.80   # ajustar na prática, igual fizemos com a bo
 TRIANGULO_MAX_GIROS = 90
 TRIANGULO_MAX_APPROACH_STEPS = 90
 TRIANGULO_LOST_FRAMES = 15
-TRIANGULO_APPROACH_SPEED = 40
-TRIANGULO_APPROACH_STEP_TIME = 0.18
+TRIANGULO_APPROACH_SPEED = 30
+TRIANGULO_APPROACH_STEP_TIME = 0.15
 TRIANGULO_CENTER_MAX_TENTATIVAS = 25
 TRIANGULO_CENTER_LOST_FRAMES = 15
 # ===================== CONFIGURAÇÕES =====================
@@ -79,8 +118,8 @@ MAX_ENTREGAS = 3
 BUSCA_FINAL_MAX_GIROS = 20  # ajustar na prática
 
 # Pinos
-PINO_SG90 = 20
-PINO_PESADO = 16
+PINO_SG90 = 21
+PINO_PESADO = 20
 
 ANGULO_INICIAL = 90
 
@@ -88,6 +127,7 @@ h = lgpio.gpiochip_open(0)
 
 lgpio.gpio_claim_output(h, PINO_SG90)
 lgpio.gpio_claim_output(h, PINO_PESADO)
+GPIO.gpio_claim_input(h, BUTTON, GPIO.SET_PULL_UP)
 
 _angulo_atual = {
     PINO_SG90: ANGULO_INICIAL,
@@ -148,6 +188,7 @@ def buscar_bola():
     depois da 3ª entrega). Retorna True se achou.
     """
     for _ in range(BUSCA_FINAL_MAX_GIROS):
+        checar_parada()
         turn_right(speed=55)
         time.sleep(TURN_PULSE)
         parar_motores()
@@ -166,7 +207,7 @@ def buscar_bola():
 def acionar_saida():
     print("saindo")
     
-    os.execv(sys.executable, [sys.executable, "/home/pi/ROBO_DOGO_2026/codes_rasp/PROTOTIPAGEM_LINE/resgate.py"])
+    os.execv(sys.executable, [sys.executable, "/home/pi/ROBO_DOGO_2026/codes_rasp/PROTOTIPAGEM_LINE/seguidor_debug2.py"])
 
 
 def _mascara_cor_tri(hsv, cor):
@@ -307,6 +348,7 @@ def centralizar_triangulo():
     print(f"🔎 [centralizar_triangulo] ALVO_COR ativo = {ALVO_COR!r}")
     perdida = 0
     for _ in range(TRIANGULO_CENTER_MAX_TENTATIVAS):
+        checar_parada()
         crop = capturar_crop()
         if crop is None:
             parar_motores()
@@ -358,6 +400,7 @@ def aproximar_triangulo():
     perdida = 0
 
     for passo in range(TRIANGULO_MAX_APPROACH_STEPS):
+        checar_parada()
         crop = capturar_crop()
         if crop is None:
             parar_motores()
@@ -402,6 +445,7 @@ def buscar_triangulo():
     """Gira no lugar até achar um triângulo. Retorna True se achou."""
     print(f"🔎 [buscar_triangulo] ALVO_COR ativo = {ALVO_COR!r}")
     for _ in range(TRIANGULO_MAX_GIROS):
+        checar_parada()
         crop = capturar_crop()
         if crop is not None:
             cx, area, info = detectar_entrega(crop)
@@ -426,6 +470,7 @@ def entregar_bola(cor_alvo=None):
     global ALVO_COR
     ALVO_COR = cor_alvo
 
+    checar_parada()
     parar_motores()
     time.sleep(0.5)
 
@@ -462,6 +507,7 @@ def entregar_bola(cor_alvo=None):
 
     # Recentraliza uma última vez, já perto, pra garantir que a bola
     # caia no MEIO do retângulo e não na ponta.
+    checar_parada()
     print("🎯 Recentralizando antes de soltar...")
     if not centralizar_triangulo():
         print("❌ Perdeu o triângulo na recentralização final")
@@ -474,19 +520,23 @@ def entregar_bola(cor_alvo=None):
         ALVO_COR = None
         return False
 
+    checar_parada()
     verificar_e_afastar_bola_bloqueio()   # <-- checa e afasta bola do canto, se houver
 
-
+    checar_parada()
     print("📤 Soltando a bola...")
     mover(40,40)
-    time.sleep(1.0)
-    parar_motores
-    angulo(180)
-    #mover_servo(PINO_PESADO, 30, velocidade=10)
-    oscilar_servo_rapido(PINO_PESADO, angulo_a=35, angulo_b=50, repeticoes=20, delay=0.02)
-    mover_servo(PINO_PESADO, 150, velocidade=10)
-    mover(-30,-30)
     time.sleep(1.5)
+    parar_motores()          # <-- adiciona os parênteses
+    angulo(170)
+    oscilar_servo_rapido(PINO_PESADO, angulo_a=35, angulo_b=50, repeticoes=10, delay=0.1)
+    mover_servo(PINO_PESADO, 150, velocidade=50)
+    time.sleep(0.5)
+    mover_servo(PINO_PESADO, 140, velocidade=50)
+    time.sleep(0.5)
+    mover(-30,-30)
+    time.sleep(1.0)
+    parar_motores()          # <-- adiciona essa também, no final da ré
     parar_servo(PINO_PESADO)
     parar_servo(PINO_SG90)
     print("✅ Bola entregue")
@@ -494,7 +544,6 @@ def entregar_bola(cor_alvo=None):
     return True    
 
 def mover_servo(pino, angulo, velocidade=100, pulso_min=500, pulso_max=2500):
-    """Move suave, passo a passo (usa a velocidade pra controlar o delay)."""
     angulo = max(0, min(180, angulo))
     velocidade = max(1, min(100, velocidade))
 
@@ -504,16 +553,23 @@ def mover_servo(pino, angulo, velocidade=100, pulso_min=500, pulso_max=2500):
     passo = 2 if angulo > angulo_atual else -2
 
     for ang in range(int(angulo_atual), int(angulo), passo):
+        checar_parada()
         largura_pulso = pulso_min + (ang / 180.0) * (pulso_max - pulso_min)
-        lgpio.tx_servo(h, pino, int(largura_pulso))
+        try:
+            lgpio.tx_servo(h, pino, int(largura_pulso))
+        except lgpio.error as e:
+            print(f"⚠️ Falha ao mover servo (pino={pino}, pulso={largura_pulso:.0f}): {e}")
+            continue
         if delay_por_passo > 0:
             time.sleep(delay_por_passo)
 
     _angulo_atual[pino] = angulo
     time.sleep(0.8)
 
-    # desliga o PWM
-    lgpio.tx_servo(h, pino, 0)
+    try:
+        lgpio.tx_servo(h, pino, 0)
+    except lgpio.error as e:
+        print(f"⚠️ Falha ao desligar PWM do servo (pino={pino}): {e}")
 
 def angulo(ang):
     ang = max(0, min(180, ang))
@@ -527,12 +583,12 @@ def angulo(ang):
     lgpio.tx_servo(h, PINO_SG90, pulso)
 
 def mover_servo_direto(pino, angulo, pulso_min=500, pulso_max=2500):
-    """Manda o pulso direto pro ângulo, sem passar por passos intermediários."""
     angulo = max(0, min(180, angulo))
     largura_pulso = pulso_min + (angulo / 180.0) * (pulso_max - pulso_min)
     lgpio.tx_servo(h, pino, int(largura_pulso))
     time.sleep(0.15)
     parar_servo(pino)
+    _angulo_atual[pino] = angulo 
 
 
 def oscilar_servo_rapido(pino, angulo_a, angulo_b, repeticoes=1, delay=0.15):
@@ -542,6 +598,7 @@ def oscilar_servo_rapido(pino, angulo_a, angulo_b, repeticoes=1, delay=0.15):
     ponta pra dar tempo do servo fisicamente chegar lá antes de inverter.
     """
     for i in range(repeticoes):
+        checar_parada()
         mover_servo_direto(pino, angulo_a)
         time.sleep(delay)
         mover_servo_direto(pino, angulo_b)
@@ -573,6 +630,7 @@ def centralizar_bola():
     """
     perdida = 0
     for _ in range(CENTER_MAX_TENTATIVAS):
+        checar_parada()
         crop = capturar_crop()
         if crop is None:
             parar_motores()
@@ -656,6 +714,7 @@ def aproximar_bola():
     perdida = 0
 
     for passo in range(MAX_APPROACH_STEPS):
+        checar_parada()
         crop = capturar_crop()
         if crop is None:
             print("❌ Erro na câmera durante aproximação")
@@ -747,6 +806,7 @@ def verificar_e_afastar_bola_bloqueio():
 
 
 def afastar_bola_do_canto():
+    '''checar_parada()
     mover(-30, -30)
     time.sleep(0.5)
     mover_servo(PINO_PESADO, 5, velocidade=10)
@@ -759,7 +819,7 @@ def afastar_bola_do_canto():
     mover(-30, 30)
     time.sleep(0.4)
     mover(30, -30)
-    time.sleep(0.2)
+    time.sleep(0.2)'''
     pass    
 
 # ===================== SETUP CÂMERA E MODELO =====================
@@ -792,112 +852,139 @@ print("🎯 Mapeamento classe -> cor de entrega:", CLASSE_COR_ENTREGA)
 cv2.namedWindow("Detecção", cv2.WINDOW_NORMAL)
 mover_servo(PINO_PESADO, 150, velocidade=100)
 entregas_realizadas = 0
+
+# Sobe a thread do botão antes do loop principal, igual no seguidor_debug2.py
+threading.Thread(target=botao_thread, daemon=True).start()
+
 # ===================== LOOP PRINCIPAL =====================
 try:
     print("🚗 Iniciando busca por bolas...")
     while True:
-        turn_right(speed=55)
-        time.sleep(TURN_PULSE)
+        robo_ativo.wait()  # trava aqui se o botao pausou o robo
+        try:
+            checar_parada()
+            turn_right(speed=55)
+            time.sleep(TURN_PULSE)
 
-        parar_motores()
+            parar_motores()
 
-        # Espera a vibração parar
-        time.sleep(0.25)
+            # Espera a vibração parar
+            time.sleep(0.25)
 
-        # Descarta alguns frames antigos da câmera
-        for _ in range(4):
-            cap.read()
+            # Descarta alguns frames antigos da câmera
+            for _ in range(4):
+                cap.read()
 
-        # Captura um frame atualizado
-        ret, frame = cap.read()
-        if not ret:
-            print("❌ Erro na câmera")
-            break
-        crop = center_crop(frame, CROP_W, CROP_H)
-        inicio = time.perf_counter()
-        results = model.predict(
-            crop,
-            imgsz=(320, 256),
-            conf=CONF_THRES,
-            verbose=False,
-            show=False
-        )
-        print((time.perf_counter() - inicio) * 1000)
-        r = results[0]
-        boxes = getattr(r, "boxes", None)
+            # Captura um frame atualizado
+            ret, frame = cap.read()
+            if not ret:
+                print("❌ Erro na câmera")
+                break
+            crop = center_crop(frame, CROP_W, CROP_H)
+            inicio = time.perf_counter()
+            results = model.predict(
+                crop,
+                imgsz=(320, 256),
+                conf=CONF_THRES,
+                verbose=False,
+                show=False
+            )
+            print((time.perf_counter() - inicio) * 1000)
+            r = results[0]
+            boxes = getattr(r, "boxes", None)
 
-        # SEMPRE mostra a tela, com ou sem deteccao (r.plot() desenha as
-        # caixas se houver, ou so a imagem crua se nao houver nada)
-        annotated = r.plot()
-        cv2.imshow("Detecção", annotated)
-        
+            # SEMPRE mostra a tela, com ou sem deteccao (r.plot() desenha as
+            # caixas se houver, ou so a imagem crua se nao houver nada)
+            annotated = r.plot()
+            cv2.imshow("Detecção", annotated)
+            
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
-        if boxes is not None and len(boxes) > 0:
-            idx = escolher_indice_mais_perto(boxes)
-            xyxy = boxes.xyxy[idx].tolist()
-            x1, y1, x2, y2 = map(int, xyxy)
-            cx = (x1 + x2) // 2
-            cls_id = int(boxes.cls[idx].item()) if getattr(boxes, "cls", None) is not None else None
-            nome_classe = model.names.get(cls_id, "desconhecida") if cls_id is not None else "desconhecida"
-            print(f"🎯 Bola detectada em cx={cx} | classe={cls_id} ({nome_classe})")
+            if boxes is not None and len(boxes) > 0:
+                idx = escolher_indice_mais_perto(boxes)
+                xyxy = boxes.xyxy[idx].tolist()
+                x1, y1, x2, y2 = map(int, xyxy)
+                cx = (x1 + x2) // 2
+                cls_id = int(boxes.cls[idx].item()) if getattr(boxes, "cls", None) is not None else None
+                nome_classe = model.names.get(cls_id, "desconhecida") if cls_id is not None else "desconhecida"
+                print(f"🎯 Bola detectada em cx={cx} | classe={cls_id} ({nome_classe})")
 
-            if abs(cx - IMG_CENTER_X) > TOLERANCE:
-                if not centralizar_bola():
-                    print("🔄 Não conseguiu centralizar, voltando pra busca")
+                if abs(cx - IMG_CENTER_X) > TOLERANCE:
+                    if not centralizar_bola():
+                        print("🔄 Não conseguiu centralizar, voltando pra busca")
+                        continue
+
+                print("⬆️ Centralizado → avançando")
+                if not aproximar_bola():
+                    print("🔄 Não conseguiu se aproximar, voltando pra busca")
                     continue
 
-            print("⬆️ Centralizado → avançando")
-            if not aproximar_bola():
-                print("🔄 Não conseguiu se aproximar, voltando pra busca")
-                continue
+                print("🦾 Fechando garra na bola")
+                checar_parada()
+                mover(-10,-10)
+                time.sleep(0.09)
+                parar_motores()
+                mover_servo(PINO_PESADO, 40, velocidade=10)
+                angulo(0)
+                mover(-30,-30)
+                time.sleep(0.1)
+                parar_motores()
+                mover(30,30)
+                time.sleep(0.5)
+                parar_motores()
+                mover(-10,-10)
+                time.sleep(0.09)
+                parar_motores()
+                mover_servo(PINO_PESADO, 0, velocidade=5)
+                mover(30,30)
+                time.sleep(0.5)
+                parar_motores()
+                mover(-30,-30)
+                time.sleep(0.5)
+                parar_motores()
+                mover(30,30)
+                time.sleep(0.1)
+                parar_motores()
+                mover(-30,-30)
+                time.sleep(0.1)
+                parar_motores()
+                mover(-10,-10)
+                time.sleep(0.09)
+                parar_motores()
+                mover_servo(PINO_PESADO, 150, velocidade=5)
+                mover(-50,-50)
+                time.sleep(0.3)
+                parar_motores()
+                cor_alvo = CLASSE_COR_ENTREGA.get(cls_id)
+                if cor_alvo is None:
+                    print(f"⚠️ Classe {cls_id} não mapeada em CLASSE_COR_ENTREGA, entregando em qualquer área")
+                entregar_bola(cor_alvo)
+                entregas_realizadas += 1
 
-            print("🦾 Fechando garra na bola")
-            mover(-10,-10)
-            time.sleep(0.09)
-            mover_servo(PINO_PESADO, 40, velocidade=10)
-            angulo(0)
-            mover(-30,-30)
-            time.sleep(0.1)
-            mover(30,30)
-            time.sleep(0.5)
-            mover(-10,-10)
-            time.sleep(0.09)
-            mover_servo(PINO_PESADO, 0, velocidade=5)
-            mover(30,30)
-            time.sleep(0.5)
-            mover(-30,-30)
-            time.sleep(0.5)
-            mover(30,30)
-            time.sleep(0.1)
-            mover(-30,-30)
-            time.sleep(0.1)
-            mover(-10,-10)
-            time.sleep(0.09)
-            mover_servo(PINO_PESADO, 150, velocidade=5)
-            mover(-50,-50)
-            time.sleep(0.3)
-            # Define pra qual cor de área entregar, baseado na classe da bola pega
-            cor_alvo = CLASSE_COR_ENTREGA.get(cls_id)
-            if cor_alvo is None:
-                print(f"⚠️ Classe {cls_id} não mapeada em CLASSE_COR_ENTREGA, entregando em qualquer área")
-            entregar_bola(cor_alvo)
-            entregas_realizadas += 1
+                if entregas_realizadas >= MAX_ENTREGAS:
+                    print("🏁 3 entregas concluídas, fazendo busca final...")
+                    if not buscar_bola():
+                        print("🚪 Nenhuma bola na busca final, acionando saída")
+                        acionar_saida()
+                        break
+                    else:
+                        print("🎯 Achou mais uma bola na busca final, continuando normalmente")
+                        # deixa o loop seguir e a próxima iteração já detecta e pega essa bola
 
-            if entregas_realizadas >= MAX_ENTREGAS:
-                print("🏁 3 entregas concluídas, fazendo busca final...")
-                if not buscar_bola():
-                    print("🚪 Nenhuma bola na busca final, acionando saída")
-                    acionar_saida()
-                    break
-                else:
-                    print("🎯 Achou mais uma bola na busca final, continuando normalmente")
-                    # deixa o loop seguir e a próxima iteração já detecta e pega essa bola
+            else:
+                print("🔄 Nenhuma bola — novo passo de giro")
 
-        else:
-            print("🔄 Nenhuma bola — novo passo de giro")
+        except RoboParado:
+            print("🛑 Robo parado pelo botao,voltando pro seguidor...")
+            parar_motores()
+            cap.release()
+            GPIO.gpiochip_close(h)
+            os.execv(sys.executable, [sys.executable, "/home/pi/ROBO_DOGO_2026/codes_rasp/PROTOTIPAGEM_LINE/seguidor_debug2.py"])
+            '''robo_ativo.wait()
+            print("▶️ Retomando busca por bolas...")
+            continue'''
 
 except KeyboardInterrupt:
     print("\n🛑 Interrompido pelo usuário.")
