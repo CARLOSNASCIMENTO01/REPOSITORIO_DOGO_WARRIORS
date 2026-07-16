@@ -80,7 +80,7 @@ STOP_AREA_RATIO_TRIANGULO = 0.80   # ajustar na prática, igual fizemos com a bo
 TRIANGULO_MAX_GIROS = 90
 TRIANGULO_MAX_APPROACH_STEPS = 90
 TRIANGULO_LOST_FRAMES = 15
-TRIANGULO_APPROACH_SPEED = 30
+TRIANGULO_APPROACH_SPEED = 40 #30
 TRIANGULO_APPROACH_STEP_TIME = 0.15
 TRIANGULO_CENTER_MAX_TENTATIVAS = 25
 TRIANGULO_CENTER_LOST_FRAMES = 15
@@ -98,13 +98,13 @@ IN3, IN4, ENB = 22, 23, 13
 VEL_MAX = 50
 VEL_MIN = -VEL_MAX
 # ===================== APROXIMAÇÃO POR TAMANHO DE BBOX =====================
-APPROACH_SPEED = 30        # velocidade do avanço durante a aproximação
-APPROACH_STEP_TIME = 0.15  # duração de cada "passo" de avanço/correção
+APPROACH_SPEED = 50        # velocidade do avanço durante a aproximação # 30
+APPROACH_STEP_TIME = 0.18  # duração de cada "passo" de avanço/correção # 0.15
 STOP_AREA_RATIO = 0.35     # bbox_area / crop_area -> ajustar na prática!
 MAX_APPROACH_STEPS = 60    # trava de segurança (evita loop infinito)
 LOST_BALL_FRAMES = 8       # quantos frames sem detectar até desistir
-TURN_PULSE = 0.2
-STOP_TIME = 0.2
+TURN_PULSE = 0.24 #0.2
+STOP_TIME = 0.12 #0.2
 FORWARD_TIME = 0.6
 
 # ===================== CENTRALIZAÇÃO PROPORCIONAL =====================
@@ -531,16 +531,17 @@ def entregar_bola(cor_alvo=None):
     time.sleep(1.5)
     parar_motores()          # <-- adiciona os parênteses
     angulo(170)
-    oscilar_servo_rapido(PINO_PESADO, angulo_a=35, angulo_b=50, repeticoes=10, delay=0.1)
+    oscilar_servo_lgpio(PINO_PESADO, 40, 90,10,0.2)
+   
     mover_servo(PINO_PESADO, 150, velocidade=50)
     time.sleep(0.5)
     mover_servo(PINO_PESADO, 140, velocidade=50)
-    time.sleep(0.5)
+    time.sleep(1.0)
     mover(-30,-30)
     time.sleep(1.0)
     parar_motores()          # <-- adiciona essa também, no final da ré
-    parar_servo(PINO_PESADO)
-    parar_servo(PINO_SG90)
+    #parar_servo(PINO_PESADO)
+    #parar_servo(PINO_SG90)
     print("✅ Bola entregue")
     ALVO_COR = None
     return True    
@@ -588,23 +589,51 @@ def mover_servo_direto(pino, angulo, pulso_min=500, pulso_max=2500):
     angulo = max(0, min(180, angulo))
     largura_pulso = pulso_min + (angulo / 180.0) * (pulso_max - pulso_min)
     lgpio.tx_servo(h, pino, int(largura_pulso))
-    time.sleep(0.15)
+    time.sleep(0.01)
     parar_servo(pino)
     _angulo_atual[pino] = angulo 
 
 
-def oscilar_servo_rapido(pino, angulo_a, angulo_b, repeticoes=1, delay=0.15):
+def oscilar_servo_lgpio(pino, angulo_a, angulo_b, repeticoes=5, delay=0.15):
     """
-    Alterna o servo rapidamente entre angulo_a e angulo_b, sem suavizar
-    (pulso direto em cada ponta). 'delay' é o tempo de espera em cada
-    ponta pra dar tempo do servo fisicamente chegar lá antes de inverter.
+    Oscila servo rapidamente usando diretamente lgpio.tx_servo().
+    Não usa mover_servo() nem parar_servo().
     """
-    for i in range(repeticoes):
-        checar_parada()
-        mover_servo_direto(pino, angulo_a)
-        time.sleep(delay)
-        mover_servo_direto(pino, angulo_b)
-        time.sleep(delay)
+
+    pulso_min = 500
+    pulso_max = 2500
+
+    def angulo_para_pulso(angulo):
+        angulo = max(0, min(180, angulo))
+        return int(
+            pulso_min +
+            (angulo / 180.0) * (pulso_max - pulso_min)
+        )
+
+    pulso_a = angulo_para_pulso(angulo_a)
+    pulso_b = angulo_para_pulso(angulo_b)
+
+    print(f"Oscilando servo GPIO {pino}: {angulo_a}({pulso_a}) <-> {angulo_b}({pulso_b})")
+
+    try:
+        for _ in range(repeticoes):
+            checar_parada()
+
+            # vai para posição A
+            lgpio.tx_servo(h, pino, pulso_a)
+            time.sleep(delay)
+
+            # vai para posição B
+            lgpio.tx_servo(h, pino, pulso_b)
+            time.sleep(delay)
+
+    except lgpio.error as e:
+        print("ERRO OSCILA SERVO:", e)
+
+    finally:
+        # mantém o último pulso por um pouco
+        # não corta PWM imediatamente
+        time.sleep(0.2)
 
 
 def parar_servo(pino):
@@ -927,13 +956,14 @@ try:
                 mover(-10,-10)
                 time.sleep(0.09)
                 parar_motores()
-                mover_servo(PINO_PESADO, 40, velocidade=10)
                 angulo(0)
+                mover_servo(PINO_PESADO, 30, velocidade=10)
+                parar_servo(PINO_SG90)
                 mover(-30,-30)
                 time.sleep(0.1)
                 parar_motores()
-                mover(30,30)
-                time.sleep(0.5)
+                mover(26,26)
+                time.sleep(0.63)
                 parar_motores()
                 mover(-10,-10)
                 time.sleep(0.09)

@@ -198,12 +198,16 @@ def sonar_valido():
 
 
 def iniciar_serial():
-    """Sobe a thread do sonar e faz o handshake, uma vez so."""
+    """Sobe a thread do sonar e faz o handshake, uma vez so, em background."""
     if _serial_thread_iniciada[0]:
         return
-    handshake_serial()
-    threading.Thread(target=serial_thread, daemon=True).start()
     _serial_thread_iniciada[0] = True
+
+    def _start():
+        handshake_serial()
+        serial_thread()
+
+    threading.Thread(target=_start, daemon=True).start()
 
 
 # ===================== DETECÇÃO DE TRIÂNGULO (área de entrega) =====================
@@ -391,6 +395,15 @@ def iniciar_mpu():
     resetar_giroscopio()
     print("[MPU6050] Pronto")
     Thread(target=_gyro_thread, daemon=True).start()
+
+_mpu_thread_iniciada = [False]
+
+def iniciar_mpu_thread():
+    """Sobe a calibração + thread de leitura do giroscópio, uma vez só, sob demanda."""
+    if _mpu_thread_iniciada[0]:
+        return
+    _mpu_thread_iniciada[0] = True
+    Thread(target=iniciar_mpu, daemon=True).start()    
 
 ACCEL_XOUT_H = 0x3B
 ACCEL_YOUT_H = 0x3D
@@ -599,17 +612,42 @@ def detectar_linha_embaixo(frame):
 
 
 def acionar_saida():
-    """
-    Anda pra frente a VEL_SAIDA ate se deparar com QUALQUER um destes casos:
-      1) TRIANGULO       - camera da frente (a mesma que ve bola/entrega)
-      2) LINHA           - contorno preto na camera de baixo (chao)
-      3) LATERAL_ABERTA  - muita distancia no ultrassonico lateral (saiu
-                            de perto de parede, campo aberto)
-      4) PAREDE_FRENTE   - pouca distancia no ultrassonico da frente
-                            (bateu numa parede)
-    Para assim que identifica o primeiro caso e retorna uma string dizendo
-    qual foi.
-    """
+    global cap_linha, ALVO_COR
+    abrir_camera_linha()
+    iniciar_mpu_thread()
+    iniciar_serial()
+
+    # ---- PONTO DE PARTIDA: vai at� o canto VERDE e se alinha antes de
+    # come�ar o movimento cont�nuo de sa�da. ----
+    print("[SAIDA] Buscando o canto VERDE como ponto de partida...")
+    ALVO_COR = "verde"
+
+    if not buscar_triangulo():
+        print("[SAIDA] N�o achou o canto verde, seguindo sem ponto de partida fixo")
+    elif not centralizar_triangulo():
+        print("[SAIDA] N�o conseguiu centralizar no canto verde")
+    elif not aproximar_triangulo():
+        print("[SAIDA] N�o conseguiu se aproximar do canto verde")
+    else:
+        print("[SAIDA] Alinhado no canto verde, ajustando orienta��o de partida...")
+        parar_motores()
+        print("guinadinha")
+        guinada_pid("D", 50)
+        mover(30, 30)
+        time.sleep(1.2)
+        mover(-10, -10)
+        time.sleep(0.09)
+        mover(25, 0)
+        time.sleep(0.3)
+        mover(0, 25)
+        time.sleep(0.3)
+        guinada_pid("D", 50)
+        mover(-10, -10)
+        time.sleep(0.09)
+
+    ALVO_COR = None
+    # ---- fim do ponto de partida ----
+
     print("[SAIDA] saindo, andando ate achar triangulo/linha/parede...")
     while True:
         checar_parada()
@@ -827,7 +865,7 @@ def detectar_entrega(crop):
 
 def centralizar_triangulo():
     """Igual centralizar_bola(), mas usando detectar_entrega()."""
-    print(f"🔎 [centralizar_triangulo] ALVO_COR ativo = {ALVO_COR!r}")
+    print(f"[centralizar_triangulo] ALVO_COR ativo = {ALVO_COR!r}")
     perdida = 0
     for _ in range(TRIANGULO_CENTER_MAX_TENTATIVAS):
         checar_parada()
@@ -844,7 +882,7 @@ def centralizar_triangulo():
         if cx is None:
             perdida += 1
             if perdida >= TRIANGULO_CENTER_LOST_FRAMES:
-                print("❌ Perdeu o triângulo durante centralização")
+                print("Perdeu o triângulo durante centralização")
                 parar_motores()
                 return False
             continue
@@ -853,7 +891,7 @@ def centralizar_triangulo():
         erro = cx - IMG_CENTER_X
 
         if abs(erro) <= TOLERANCE:
-            print(f"✅ Centralizado no triângulo (cx={cx})")
+            print(f"Centralizado no triângulo (cx={cx})")
             parar_motores()
             return True
 
@@ -870,14 +908,14 @@ def centralizar_triangulo():
         parar_motores()
         time.sleep(0.05)
 
-    print("⚠️ Estourou tentativas de centralização no triângulo")
+    print("Estourou tentativas de centralização no triângulo")
     parar_motores()
     return False
 
 
 def aproximar_triangulo():
     """Igual aproximar_bola(), mas até chegar perto do triângulo pra soltar a bola."""
-    print(f"🔎 [aproximar_triangulo] ALVO_COR ativo = {ALVO_COR!r}")
+    print(f"[aproximar_triangulo] ALVO_COR ativo = {ALVO_COR!r}")
     crop_area = CROP_W * CROP_H
     perdida = 0
 
@@ -892,7 +930,7 @@ def aproximar_triangulo():
 
         if cx is None:
             perdida += 1
-            print(f"⚠️ Triângulo sumiu durante aproximação ({perdida}/{TRIANGULO_LOST_FRAMES})")
+            print(f"Triângulo sumiu durante aproximação ({perdida}/{TRIANGULO_LOST_FRAMES})")
             if perdida >= TRIANGULO_LOST_FRAMES:
                 parar_motores()
                 return False
@@ -901,15 +939,15 @@ def aproximar_triangulo():
 
         perdida = 0
         ratio = area / crop_area
-        print(f"📐 [entrega] passo={passo} area_ratio={ratio:.2f} cx={cx} cor={info['cor']}")
+        print(f"[entrega] passo={passo} area_ratio={ratio:.2f} cx={cx} cor={info['cor']}")
 
         if ratio >= STOP_AREA_RATIO_TRIANGULO:
-            print("✅ Perto o suficiente do triângulo, parando")
+            print("Perto o suficiente do triângulo, parando")
             parar_motores()
             return True
 
         if abs(cx - IMG_CENTER_X) > TOLERANCE:
-            print("↔️ Saiu do centro durante aproximação da entrega, recentralizando")
+            print("Saiu do centro durante aproximação da entrega, recentralizando")
             if not centralizar_triangulo():
                 return False
             continue
@@ -919,7 +957,7 @@ def aproximar_triangulo():
         parar_motores()
         time.sleep(0.05)
 
-    print("⚠️ Estourou o limite de passos na aproximação da entrega")
+    print("Estourou o limite de passos na aproximação da entrega")
     parar_motores()
     return False
 
@@ -960,45 +998,45 @@ def entregar_bola(cor_alvo=None):
         cap.read()
 
     if cor_alvo:
-        print(f"🔺 Procurando área de entrega {cor_alvo.upper()}...")
+        print(f"Procurando área de entrega {cor_alvo.upper()}...")
     else:
-        print("🔺 Procurando área de entrega (qualquer cor)...")
+        print("Procurando área de entrega (qualquer cor)...")
 
     if not buscar_triangulo():
-        print("❌ Não achou nenhum triângulo, abortando entrega")
+        print("Não achou nenhum triângulo, abortando entrega")
         ALVO_COR = None
         return False
 
     if not centralizar_triangulo():
-        print("❌ Não conseguiu centralizar no triângulo")
+        print("Não conseguiu centralizar no triângulo")
         ALVO_COR = None
         return False
 
-    print("⬆️ Centralizado no triângulo → aproximando")
+    print("Centralizado no triângulo → aproximando")
     if not aproximar_triangulo():
-        print("❌ Não conseguiu se aproximar do triângulo")
+        print("Não conseguiu se aproximar do triângulo")
         ALVO_COR = None
         return False
 
-    print("📤 Soltando a bola...")
-    print("⬆️ Centralizado no triângulo → aproximando")
+    print("Soltando a bola...")
+    print("Centralizado no triângulo → aproximando")
     if not aproximar_triangulo():
-        print("❌ Não conseguiu se aproximar do triângulo")
+        print("Não conseguiu se aproximar do triângulo")
         ALVO_COR = None
         return False
 
     # Recentraliza uma última vez, já perto, pra garantir que a bola
     # caia no MEIO do retângulo e não na ponta.
     checar_parada()
-    print("🎯 Recentralizando antes de soltar...")
+    print("Recentralizando antes de soltar...")
     if not centralizar_triangulo():
-        print("❌ Perdeu o triângulo na recentralização final")
+        print("Perdeu o triângulo na recentralização final")
         ALVO_COR = None
         return False
     
-    print("🎯 Recentralizando antes de soltar...")
+    print("Recentralizando antes de soltar...")
     if not centralizar_triangulo():
-        print("❌ Perdeu o triângulo na recentralização final")
+        print("Perdeu o triângulo na recentralização final")
         ALVO_COR = None
         return False
 
@@ -1006,7 +1044,7 @@ def entregar_bola(cor_alvo=None):
     verificar_e_afastar_bola_bloqueio()   # <-- checa e afasta bola do canto, se houver
 
     checar_parada()
-    print("📤 Soltando a bola...")
+    print("Soltando a bola...")
     mover(40,40)
     time.sleep(1.5)
     parar_motores()          # <-- adiciona os parênteses
@@ -1021,7 +1059,7 @@ def entregar_bola(cor_alvo=None):
     parar_motores()          # <-- adiciona essa também, no final da ré
     parar_servo(PINO_PESADO)
     parar_servo(PINO_SG90)
-    print("✅ Bola entregue")
+    print("Bola entregue")
     ALVO_COR = None
     return True    
 
@@ -1040,7 +1078,7 @@ def mover_servo(pino, angulo, velocidade=100, pulso_min=500, pulso_max=2500):
         try:
             lgpio.tx_servo(h, pino, int(largura_pulso))
         except lgpio.error as e:
-            print(f"⚠️ Falha ao mover servo (pino={pino}, pulso={largura_pulso:.0f}): {e}")
+            print(f"Falha ao mover servo (pino={pino}, pulso={largura_pulso:.0f}): {e}")
             continue
         if delay_por_passo > 0:
             time.sleep(delay_por_passo)
@@ -1051,7 +1089,7 @@ def mover_servo(pino, angulo, velocidade=100, pulso_min=500, pulso_max=2500):
     try:
         lgpio.tx_servo(h, pino, 0)
     except lgpio.error as e:
-        print(f"⚠️ Falha ao desligar PWM do servo (pino={pino}): {e}")
+        print(f"Falha ao desligar PWM do servo (pino={pino}): {e}")
 
 def angulo(ang):
     ang = max(0, min(180, ang))
@@ -1123,7 +1161,7 @@ def centralizar_bola():
         if cx is None:
             perdida += 1
             if perdida >= CENTER_LOST_FRAMES:
-                print("❌ Perdeu a bola durante centralização")
+                print("Perdeu a bola durante centralização")
                 parar_motores()
                 return False
             continue
@@ -1132,7 +1170,7 @@ def centralizar_bola():
         erro = cx - IMG_CENTER_X
 
         if abs(erro) <= TOLERANCE:
-            print(f"✅ Centralizado (cx={cx})")
+            print(f"Centralizado (cx={cx})")
             parar_motores()
             return True
 
@@ -1141,17 +1179,17 @@ def centralizar_bola():
         pulso = 0.05 + erro_norm * 0.10  # erro grande -> pulso mais longo tb
 
         if erro < 0:
-            print(f"⬅️ Corrigindo esquerda (erro={erro}, speed={speed:.0f})")
+            print(f"Corrigindo esquerda (erro={erro}, speed={speed:.0f})")
             turn_left(speed=speed)
         else:
-            print(f"➡️ Corrigindo direita (erro={erro}, speed={speed:.0f})")
+            print(f"Corrigindo direita (erro={erro}, speed={speed:.0f})")
             turn_right(speed=speed)
 
         time.sleep(pulso)
         parar_motores()
         time.sleep(0.05)  # deixa a vibração assentar antes de recapturar
 
-    print("⚠️ Estourou tentativas de centralização")
+    print("Estourou tentativas de centralização")
     parar_motores()
     return False
 
@@ -1199,7 +1237,7 @@ def aproximar_bola():
         checar_parada()
         crop = capturar_crop()
         if crop is None:
-            print("❌ Erro na câmera durante aproximação")
+            print("Erro na câmera durante aproximação")
             parar_motores()
             return False
 
@@ -1207,9 +1245,9 @@ def aproximar_bola():
 
         if cx is None:
             perdida += 1
-            print(f"⚠️ Bola sumiu durante aproximação ({perdida}/{LOST_BALL_FRAMES})")
+            print(f"Bola sumiu durante aproximação ({perdida}/{LOST_BALL_FRAMES})")
             if perdida >= LOST_BALL_FRAMES:
-                print("❌ Perdeu a bola de vez, abortando aproximação")
+                print("Perdeu a bola de vez, abortando aproximação")
                 parar_motores()
                 return False
             time.sleep(APPROACH_STEP_TIME)
@@ -1217,19 +1255,19 @@ def aproximar_bola():
 
         perdida = 0
         ratio = area / crop_area
-        print(f"📐 passo={passo} area_ratio={ratio:.2f} cx={cx}")
+        print(f"passo={passo} area_ratio={ratio:.2f} cx={cx}")
 
         if ratio >= STOP_AREA_RATIO:
-            print("✅ Perto o suficiente pra garra, parando")
+            print("Perto o suficiente pra garra, parando")
             parar_motores()
             return True
 
         # se saiu do centro, delega a correção pro centralizar_bola
         if abs(cx - IMG_CENTER_X) > TOLERANCE:
-            print("↔️ Saiu do centro durante aproximação, recentralizando")
+            print("Saiu do centro durante aproximação, recentralizando")
             centralizada = centralizar_bola()
             if not centralizada:
-                print("❌ Perdeu a bola tentando recentralizar na aproximação")
+                print("Perdeu a bola tentando recentralizar na aproximação")
                 return False
             continue  # depois de recentralizar, reavalia área no próximo passo
 
@@ -1239,7 +1277,7 @@ def aproximar_bola():
         parar_motores()
         time.sleep(0.05)
 
-    print("⚠️ Estourou o limite de passos na aproximação")
+    print("Estourou o limite de passos na aproximação")
     parar_motores()
     return False
 # ===================== FUNÇÕES AUXILIARES =====================
@@ -1283,7 +1321,7 @@ def verificar_e_afastar_bola_bloqueio():
 
     cx, area, bbox, cls_id = detectar_bola(crop)
     if cx is not None:
-        print("⚠️ Bola bloqueando a área de entrega, afastando...")
+        print("Bola bloqueando a área de entrega, afastando...")
         afastar_bola_do_canto()
 
 
@@ -1310,28 +1348,34 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
 if not cap.isOpened():
-    print(f"❌ Não consegui abrir a câmera de resgate em {CAMERA_INDEX}")
+    print(f"Não consegui abrir a câmera de resgate em {CAMERA_INDEX}")
     exit(1)
 
 # Camera de baixo (chao) - so usada dentro de acionar_saida() pra ver a
 # linha preta. Se nao abrir, acionar_saida() simplesmente ignora esse
 # criterio e segue com triangulo/ultrassonico.
-cap_linha = cv2.VideoCapture(CAMERA_INDEX_LINHA, cv2.CAP_V4L2)
-if not cap_linha.isOpened():
-    print(f"⚠️ Não consegui abrir a câmera de baixo em {CAMERA_INDEX_LINHA}, tentando fallback...")
-    cap_linha.release()
-    cap_linha = cv2.VideoCapture(CAMERA_LINHA_INDEX_FALLBACK, cv2.CAP_V4L2)
-if cap_linha.isOpened():
-    cap_linha.set(cv2.CAP_PROP_FRAME_WIDTH, LINHA_W)
-    cap_linha.set(cv2.CAP_PROP_FRAME_HEIGHT, LINHA_H)
-    cap_linha.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-else:
-    print("⚠️ Câmera de baixo indisponível, acionar_saida() vai rodar sem detecção de linha")
-    cap_linha = None
-t_mpu = Thread(target=iniciar_mpu)
-t_mpu.start()
-# Sonar (serial) - usado em acionar_saida() pra parede/lateral aberta
-iniciar_serial()
+cap_linha = None  # só é aberta dentro de acionar_saida()
+
+def abrir_camera_linha():
+    global cap_linha
+    if cap_linha is not None and cap_linha.isOpened():
+        return cap_linha
+
+    cap_linha = cv2.VideoCapture(CAMERA_INDEX_LINHA, cv2.CAP_V4L2)
+    if not cap_linha.isOpened():
+        print(f"Não consegui abrir a câmera de baixo em {CAMERA_INDEX_LINHA}, tentando fallback...")
+        cap_linha.release()
+        cap_linha = cv2.VideoCapture(CAMERA_LINHA_INDEX_FALLBACK, cv2.CAP_V4L2)
+
+    if cap_linha.isOpened():
+        cap_linha.set(cv2.CAP_PROP_FRAME_WIDTH, LINHA_W)
+        cap_linha.set(cv2.CAP_PROP_FRAME_HEIGHT, LINHA_H)
+        cap_linha.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    else:
+        print("Câmera de baixo indisponível, acionar_saida() vai rodar sem detecção de linha")
+        cap_linha = None
+
+    return cap_linha
 
 model = YOLO(MODEL_PATH)
 print("📋 Classes do modelo:", model.names)
@@ -1346,11 +1390,11 @@ for _cls_id, _nome in model.names.items():
     _nome_norm = _normalizar_nome(_nome)
     _cor = _NOME_COR_ENTREGA_NORM.get(_nome_norm)
     if _cor is None:
-        print(f"⚠️ Classe '{_nome}' (repr={_nome!r}, id={_cls_id}) não está em NOME_COR_ENTREGA, "
+        print(f"Classe '{_nome}' (repr={_nome!r}, id={_cls_id}) não está em NOME_COR_ENTREGA, "
               f"bolas dessa classe vão ser entregues em qualquer área")
     else:
         CLASSE_COR_ENTREGA[_cls_id] = _cor
-print("🎯 Mapeamento classe -> cor de entrega:", CLASSE_COR_ENTREGA)
+print("Mapeamento classe -> cor de entrega:", CLASSE_COR_ENTREGA)
 cv2.namedWindow("Detecção", cv2.WINDOW_NORMAL)
 mover_servo(PINO_PESADO, 150, velocidade=100)
 entregas_realizadas = 0
@@ -1360,11 +1404,11 @@ threading.Thread(target=botao_thread, daemon=True).start()
 
 # ===================== LOOP PRINCIPAL =====================
 try:
-    print("🚗 Iniciando busca por bolas...")
+    print("Iniciando busca por bolas...")
     while True:
         try:
             checar_parada()
-            '''turn_right(speed=55)
+            turn_right(speed=55)
             time.sleep(TURN_PULSE)
 
             parar_motores()
@@ -1379,7 +1423,7 @@ try:
             # Captura um frame atualizado
             ret, frame = cap.read()
             if not ret:
-                print("❌ Erro na câmera")
+                print("Erro na câmera")
                 break
             crop = center_crop(frame, CROP_W, CROP_H)
             inicio = time.perf_counter()
@@ -1410,24 +1454,31 @@ try:
                 cx = (x1 + x2) // 2
                 cls_id = int(boxes.cls[idx].item()) if getattr(boxes, "cls", None) is not None else None
                 nome_classe = model.names.get(cls_id, "desconhecida") if cls_id is not None else "desconhecida"
-                print(f"🎯 Bola detectada em cx={cx} | classe={cls_id} ({nome_classe})")
+                print(f"Bola detectada em cx={cx} | classe={cls_id} ({nome_classe})")
 
                 if abs(cx - IMG_CENTER_X) > TOLERANCE:
                     if not centralizar_bola():
-                        print("🔄 Não conseguiu centralizar, voltando pra busca")
+                        print("Não conseguiu centralizar, voltando pra busca")
                         continue
 
-                print("⬆️ Centralizado → avançando")
+                print("⬆Centralizado → avançando")
                 if not aproximar_bola():
-                    print("🔄 Não conseguiu se aproximar, voltando pra busca")
+                    print("Não conseguiu se aproximar, voltando pra busca")
                     continue
+                crop_final = capturar_crop()
+                cls_id = None
+                if crop_final is not None:
+                    _cx_final, _area_final, _bbox_final, cls_id = detectar_bola(crop_final)
 
-                print("🦾 Fechando garra na bola")
+                nome_classe_final = model.names.get(cls_id, "desconhecida") if cls_id is not None else "desconhecida"
+                print(f"Bola confirmada na garra: classe={cls_id} ({nome_classe_final})")
+
+                print("Fechando garra na bola")
                 checar_parada()
                 mover(-10,-10)
                 time.sleep(0.09)
                 parar_motores()
-                mover_servo(PINO_PESADO, 40, velocidade=10)
+                mover_servo(PINO_PESADO, 30, velocidade=10)
                 angulo(0)
                 mover(-30,-30)
                 time.sleep(0.1)
@@ -1460,14 +1511,14 @@ try:
                 parar_motores()
                 cor_alvo = CLASSE_COR_ENTREGA.get(cls_id)
                 if cor_alvo is None:
-                    print(f"⚠️ Classe {cls_id} não mapeada em CLASSE_COR_ENTREGA, entregando em qualquer área")
+                    print(f"Classe {cls_id} n�o mapeada em CLASSE_COR_ENTREGA, entregando em qualquer �rea")
                 entregar_bola(cor_alvo)
                 entregas_realizadas += 1
 
                 if entregas_realizadas >= MAX_ENTREGAS:
-                    print("🏁 3 entregas concluídas, fazendo busca final...")
+                    print("3 entregas concluídas, fazendo busca final...")
                     if not buscar_bola():
-                        print("🚪 Nenhuma bola na busca final, acionando saída")
+                        print("Nenhuma bola na busca final, acionando saída")
                         caso_saida = acionar_saida()
                         print(f"[SAIDA] Caso identificado: {caso_saida}")
                         parar_motores()
@@ -1478,35 +1529,22 @@ try:
                         os.execv(sys.executable, [sys.executable, "/home/pi/ROBO_DOGO_2026/codes_rasp/PROTOTIPAGEM_LINE/seguidor_debug2.py"])
                         break
                     else:
-                        print("🎯 Achou mais uma bola na busca final, continuando normalmente")
+                        print("Achou mais uma bola na busca final, continuando normalmente")
                         # deixa o loop seguir e a próxima iteração já detecta e pega essa bola
 
             else:
-                print("🔄 Nenhuma bola — novo passo de giro")'''
-            acionar_saida()
-            caso_saida = acionar_saida()
-            print(f"[SAIDA] Caso identificado: {caso_saida}")
-            parar_motores()
-            cap.release()
-            if cap_linha is not None:
-                cap_linha.release()
-            GPIO.gpiochip_close(h)
-            os.execv(sys.executable, [sys.executable, "/home/pi/ROBO_DOGO_2026/codes_rasp/PROTOTIPAGEM_LINE/seguidor_debug2.py"])
-            print("angulo z", angulo_z())
+                print(" Nenhuma bola — novo passo de giro")
         except RoboParado:
-            print("🛑 Robo parado pelo botao,voltando pro seguidor...")
+            print("Robo parado pelo botao,voltando pro seguidor...")
             parar_motores()
             cap.release()
             if cap_linha is not None:
                 cap_linha.release()
             GPIO.gpiochip_close(h)
             os.execv(sys.executable, [sys.executable, "/home/pi/ROBO_DOGO_2026/codes_rasp/PROTOTIPAGEM_LINE/seguidor_debug2.py"])
-            '''robo_ativo.wait()
-            print("▶️ Retomando busca por bolas...")
-            continue'''
 
 except KeyboardInterrupt:
-    print("\n🛑 Interrompido pelo usuário.")
+    print("\nInterrompido pelo usuário.")
 finally:
     parar_motores()
     GPIO.gpiochip_close(h)
@@ -1514,4 +1552,4 @@ finally:
     if cap_linha is not None:
         cap_linha.release()
     cv2.destroyAllWindows()
-    print("✔️ Finalizado com segurança.")
+    print("Finalizado com segurança.")

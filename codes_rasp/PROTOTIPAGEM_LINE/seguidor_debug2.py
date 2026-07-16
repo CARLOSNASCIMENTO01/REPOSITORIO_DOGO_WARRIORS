@@ -1504,6 +1504,7 @@ if __name__ == "__main__":
             try:
                 robo_ativo.wait()
                 loop_principal()
+                #mover(50 , 50)
 
                 
 
