@@ -1,4 +1,5 @@
 env_dogo/
+codes_rasp/PROTOTIPAGEM_LINE/env_moondream/
 *.pyc
 __pycache__/
 *.jpg
