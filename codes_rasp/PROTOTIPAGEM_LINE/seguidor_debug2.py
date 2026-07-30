@@ -21,6 +21,7 @@ Mudancas de comportamento pedidas (nao sao bugfix, sao features novas):
 import cv2
 import numpy as np
 import lgpio as GPIO
+import lgpio
 import time
 import serial
 import math
@@ -33,12 +34,11 @@ import smbus2
 import threading
 from threading import Thread
 
-try:
-    from ultralytics import YOLO
-    YOLO_DISPONIVEL = True
-except ImportError:
-    YOLO_DISPONIVEL = False
-    print("[VITIMA][AVISO] ultralytics nao instalado, deteccao de vitima desativada")
+# "from ultralytics import YOLO" NAO fica aqui no topo - sozinho ja custa
+# varios segundos (importa o torch inteiro) e travava o boot do seguidor
+# antes de qualquer print, mesmo o modelo de vitima nunca sendo usado nessa
+# execucao. O import so acontece dentro de carregar_modelo_vitima(), que so
+# roda se identificar_vitimas() for chamada de verdade.
 
 # =========================================================================
 # EXCECAO DE PARADA IMEDIATA
@@ -48,7 +48,18 @@ class RoboParado(Exception):
     pass
 
 robo_ativo = threading.Event()
-robo_ativo.set()  # comeca ligado
+ENTREGAS_HERDADAS = 0
+if "--auto" in sys.argv:
+    robo_ativo.set()
+else:
+    robo_ativo.clear()
+
+for arg in sys.argv[1:]:
+    if arg.startswith("--entregas="):
+        try:
+            ENTREGAS_HERDADAS = int(arg.split("=", 1)[1])
+        except ValueError:
+            ENTREGAS_HERDADAS = 0
 
 def checar_parada():
     """Chamar a cada iteracao de todo while True que segura o robo por mais
@@ -66,13 +77,19 @@ VEL_BASE = 25 #20, 25
 VEL_MAX  = 50 #45
 VEL_MIN  = -VEL_MAX
 VEL_GAP  = 25
+TEMPO_GAP_SALA_RESGATE = 3.0  # segundos em gap continuo pra considerar sala de resgate
 LIMIAR   = 80
 DEADZONE =5 # 8, 0
 AREA_MIN = 11000
-
+TCRT = 6  # GPIO BCM 5
 IN1, IN2, ENA = 17, 18, 12
 IN3, IN4, ENB = 22, 23, 13
 BUTTON = 24
+
+#servos
+PINO_SG90 = 5
+PINO_PESADO = 20
+
 
 green_min = np.array([40, 50, 45])
 green_max = np.array([85, 255, 255])
@@ -95,8 +112,8 @@ SHOW_PREVIEW    = True
 PREVIEW_EVERY_N = 3
 PREVIEW_VERDE_EVERY_N = 3
 
-CAMERA_LINHA_PATH  = None  
-CAMERA_VITIMA_PATH = None  
+CAMERA_LINHA_PATH  = "/dev/v4l/by-id/usb-Jieli_Technology_USB_Composite_Device-video-index0"
+CAMERA_VITIMA_PATH = "/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0"
 CAMERA_LINHA_INDEX_FALLBACK  = 0
 CAMERA_VITIMA_INDEX_FALLBACK = 2
 
@@ -110,6 +127,12 @@ DEBUG_VITIMA_PREVIEW =True
 # --- RESET DE USB VIA SOFTWARE ---
 USB_RESET_TENTATIVAS_ANTES_DE_RESETAR = 3  # falhas seguidas antes de tentar resetar USB
 
+ANGULO_INICIAL = 90
+
+# Servo pesado como indicador visual de ligado/desligado: levantado (150)
+# enquanto o robo esta ativo, abaixado (0) enquanto parado/esperando o botao.
+SERVO_PESADO_ANGULO_ATIVO = 140
+SERVO_PESADO_ANGULO_PARADO = 10
 
 # =========================================================================
 # ESTADO (tudo que precisa ser resetado quando o robo reinicia pelo botao)
@@ -159,7 +182,11 @@ _preview_verde_contador = 0
 # GPIO INIT
 # =========================================================================
 h = GPIO.gpiochip_open(0)
+
+lgpio.gpio_claim_output(h, PINO_SG90)
+lgpio.gpio_claim_output(h, PINO_PESADO)
 GPIO.gpio_claim_input(h, BUTTON, GPIO.SET_PULL_UP)
+GPIO.gpio_claim_input(h, TCRT)
 pins = [IN1, IN2, IN3, IN4, ENA, ENB]
 for p in pins:
     GPIO.gpio_claim_output(h, p)
@@ -191,7 +218,58 @@ def mover(velL, velR):
 def parar():
     mover(0, 0)
 
+def angulo(ang):
+    ang = max(0, min(180, ang))
+    pulso = int(500 + (2000 * ang / 180))
+    lgpio.tx_servo(h, PINO_SG90, pulso)
+    time.sleep(0.1)
+    lgpio.tx_servo(h, PINO_SG90, 0)
+    time.sleep(0.09)
 
+def mover_servo(pino, angulo_alvo, velocidade=100, pulso_min=500, pulso_max=2500, delay_base=0.02):
+    if not hasattr(mover_servo, "_angulo_atual"):
+        mover_servo._angulo_atual = {}
+
+    angulo_alvo = max(0, min(180, angulo_alvo))
+    velocidade = max(1, min(100, velocidade))
+
+    atual = mover_servo._angulo_atual.get(pino, ANGULO_INICIAL)
+    delay_por_passo = delay_base * (100 - velocidade) / 100.0
+
+    passo = 2 if angulo_alvo > atual else -2
+
+    for ang in range(int(atual), int(angulo_alvo), passo):
+        checar_parada()
+        largura_pulso = pulso_min + (ang / 180.0) * (pulso_max - pulso_min)
+        try:
+            lgpio.tx_servo(h, pino, int(largura_pulso))
+        except lgpio.error as e:
+            print(f"Falha ao mover servo (pino={pino}, pulso={largura_pulso:.0f}): {e}")
+            continue
+        if delay_por_passo > 0:
+            time.sleep(delay_por_passo)
+
+    mover_servo._angulo_atual[pino] = angulo_alvo
+    time.sleep(0.8)
+
+    try:
+        lgpio.tx_servo(h, pino, 0)
+    except lgpio.error as e:
+        print(f"Falha ao desligar PWM do servo (pino={pino}): {e}")
+
+def mover_servo_direto(pino, angulo_alvo, pulso_min=500, pulso_max=2500):
+    """Igual mover_servo(), mas sem o passo-a-passo e sem checar_parada() -
+    pra usar de dentro do botao_thread(), onde chamar checar_parada() logo
+    apos limpar robo_ativo abortaria na hora e mataria essa thread."""
+    if not hasattr(mover_servo, "_angulo_atual"):
+        mover_servo._angulo_atual = {}
+    angulo_alvo = max(0, min(180, angulo_alvo))
+    largura_pulso = pulso_min + (angulo_alvo / 180.0) * (pulso_max - pulso_min)
+    lgpio.tx_servo(h, pino, int(largura_pulso))
+    mover_servo._angulo_atual[pino] = angulo_alvo
+
+def sensor_e():
+    return GPIO.gpio_read(h, TCRT) 
 # =========================================================================
 # BOTAO - thread dedicada, toggle com debounce
 # =========================================================================
@@ -206,9 +284,20 @@ def botao_thread():
                     robo_ativo.clear()
                     parar()
                     print("[BOTAO] PAROU (aperte de novo pra reiniciar)")
+                    # mover_servo() normal chama checar_parada() a cada passo -
+                    # abortaria na hora (acabamos de limpar robo_ativo) e
+                    # mataria essa propria thread. Por isso a versao direta.
+                    try:
+                        mover_servo_direto(PINO_PESADO, SERVO_PESADO_ANGULO_PARADO)
+                    except Exception as e:
+                        print(f"[BOTAO][ERRO] Falha ao abaixar servo pesado: {e}")
                 else:
                     print("[BOTAO] REINICIANDO...")
                     robo_ativo.set()
+                    try:
+                        mover_servo_direto(PINO_PESADO, SERVO_PESADO_ANGULO_ATIVO)
+                    except Exception as e:
+                        print(f"[BOTAO][ERRO] Falha ao levantar servo pesado: {e}")
                 while GPIO.gpio_read(h, BUTTON) == 1:
                     time.sleep(0.02)
         anterior = estado
@@ -576,7 +665,13 @@ def detectar_camera():
         print(f"[Camera] Linha conectada no indice {CAMERA_LINHA_INDEX_FALLBACK}")
         return c
 
+    # Ultimo recurso: varre indices, mas NUNCA aceita o indice reservado pra
+    # camera de vitima - senao a busca da camera de linha pode "roubar" a
+    # camera de vitima sem perceber (ela abre e le frame normal, so que da
+    # camera errada), e o robo anda reto sem enxergar a linha.
     for i in range(10):
+        if i == CAMERA_VITIMA_INDEX_FALLBACK:
+            continue
         c = _abrir_camera(i)
         if c is not None:
             print(f"[Camera] Linha conectada em /dev/video{i}")
@@ -607,7 +702,10 @@ modelo_vitima = None
 
 def carregar_modelo_vitima():
     global modelo_vitima
-    if not YOLO_DISPONIVEL:
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        print("[VITIMA][AVISO] ultralytics nao instalado, deteccao de vitima desativada")
         return
     try:
         print("[VITIMA] Carregando modelo YOLO...")
@@ -638,7 +736,10 @@ def identificar_vitimas():
     """Abre a 2a camera, roda a inferencia YOLO em alguns frames e fecha.
     Retorna lista de deteccoes: [{"classe": str, "conf": float}, ...]
     Chamada dentro de area() assim que o robo entra na area de resgate."""
-    if not YOLO_DISPONIVEL or modelo_vitima is None:
+    if modelo_vitima is None:
+        carregar_modelo_vitima()  # carregamento preguicoso, so na primeira chamada
+
+    if modelo_vitima is None:
         print("[VITIMA] Modelo indisponivel, pulando deteccao")
         return []
 
@@ -773,7 +874,9 @@ def angulo_linha(contours):
     return menor_angulo
 
 
+
 def alinhar_linha(frame):
+
     global tempo_sem_linha
     angulo = angulo_linha(frame)
 
@@ -1019,6 +1122,7 @@ def guinada_pid(LADO, GRAUS, VEL_MAX_GIRO=100, VEL_MIN_GIRO=29, ZONA_CHEGADA=10)
 
 
 def meiavolta(LADO='E', GRAUS=90, VEL_MAX_GIRO=100, VEL_MIN_GIRO=25, ZONA_CHEGADA=5):
+    
     Kp_g, Ki_g, Kd_g = 0.09, 0.002, 0.01
     resetar_giroscopio()
     time.sleep(0.1)
@@ -1097,11 +1201,24 @@ def girar_ate_linha(direcao, velocidade=60, tolerancia=40, timeout=5.0):
 
 def area(contours):
     print("estou na area")
-    os.execv(sys.executable, [sys.executable, "/home/pi/ROBO_DOGO_2026/codes_rasp/PROTOTIPAGEM_LINE/resgate.py"])
+    os.execv(sys.executable, [
+        sys.executable,
+        "/home/pi/ROBO_DOGO_2026/codes_rasp/PROTOTIPAGEM_LINE/resgate.py",
+        f"--entregas={ENTREGAS_HERDADAS}",
+    ])
 
 def desvio():
+    # Sonar da frente aponta reto: numa rampa/gangorra inclinada o feixe
+    # pode bater no proprio chao e ler "parede" que nao existe. So confia
+    # nele com o robo em piso plano (mesma faixa que controle() usa pra
+    # saber que nao esta na gangorra).
+    if not (-5 < angulo_y() < 3):
+        return
     if distancia_frente() <= 6:
-        time.sleep(0.09)
+        # O Arduino alterna F/E a cada 60ms, entao cada sonar so atualiza a
+        # cada ~120ms. Um sleep menor que isso reconfere o MESMO valor em
+        # cache, nao uma leitura nova - por isso 0.15s aqui, nao 0.09s.
+        time.sleep(0.15)
         if distancia_frente() <= 5:
             mover(30, 30)
             mover(-30, -30)
@@ -1205,7 +1322,7 @@ def verde(roi):
         mover(30, 30)
         time.sleep(0.18)
         parar()
-        guinada2('E', 85, 40)
+        guinada2('E', 85, 35)
         inicio = time.time()
         while time.time() - inicio < 1.0:
             checar_parada()
@@ -1222,7 +1339,7 @@ def verde(roi):
         mover(30, 30)
         time.sleep(0.18)
         parar()
-        guinada2('D', 85, 40)
+        guinada2('D', 85, 35)
         inicio = time.time()
         while time.time() - inicio < 1.0:
             checar_parada()
@@ -1236,7 +1353,7 @@ def verde(roi):
         print("gira 180")
         mover(-12, -12)
         time.sleep(0.09)
-        guinada_pid("D", 170)
+        guinada_pid("D", 160)
         mover(30, 30)
         time.sleep(0.19)
         mover(-10, -10)
@@ -1336,7 +1453,7 @@ def detectar_travamento(roi):
 # =========================================================================
 def controle(cx, contours, roi):
     global ultimo_erro, ultimo_tempo, em_rampa, contador_gangorra
-
+    
     w = roi.shape[1]
     tempo_atual = time.time()
     dt = tempo_atual - ultimo_tempo
@@ -1378,7 +1495,9 @@ def controle(cx, contours, roi):
         mover(-10, -10)
         time.sleep(1.0)
         mover(-40, -40)
-        time.sleep(0.6)
+        time.sleep(0.1)
+        mover(-10, -10)
+        time.sleep(1.0)
         velocidade_base = 20
         velL = velocidade_base + ajuste
         velR = velocidade_base - ajuste
@@ -1394,6 +1513,30 @@ def controle(cx, contours, roi):
 # =========================================================================
 FALHAS_CAMERA_ANTES_DE_RESETAR = 15  # ~ alguns segundos de frames perdidos seguidos
 
+def achar_saida():
+    while True :
+        mover(-40,40)
+        time.sleep(0.1)
+        mover(5,-5)
+        time.sleep(0.3)
+        print("distancia",distancia_frente())
+        if distancia_frente() > 70:
+            while True :
+                mover(25,25)
+                print("cor", sensor_e)
+                if distancia_frente()< 50:
+                    mover(25,25)  
+                    time.sleep(0.6)
+                    break
+                if sensor_e () == 1 or distancia_esquerda()> 70 :
+                    mover(-10,-10)
+                    time.sleep(5.0)
+                    break
+                
+            print("achei potencial saida ")
+            mover(0,0)
+            time.sleep(2.0)
+            break
 def loop_principal():
     global ultimo_erro, ultimo_tempo, cap
     resetar_estado()
@@ -1422,7 +1565,7 @@ def loop_principal():
         falhas_camera_seguidas = 0
         #print("ANGULO Y ", angulo_y())
         #print("ULTRA", distancia_frente())
-       
+        #print("distancai fren", distancia_frente())
             
         if detectar_fita_vermelha(frame):
             continue
@@ -1448,8 +1591,9 @@ def loop_principal():
         verde(roi)
         ajuste, contours = controle(cx, contours, roi)
         desvio()
+        #achar_saida()
 
-        if gap_debug(contours) and distancia_esquerda() < 20:
+        if gap_debug(contours):
             inicio_gap = time.time()
             while True:
                 checar_parada()
@@ -1460,9 +1604,9 @@ def loop_principal():
                 if not gap_debug(contours):
                     print("[GAP] Saiu do gap, voltando a linha")
                     break
-                if time.time() - inicio_gap > 1:
+                if time.time() - inicio_gap > TEMPO_GAP_SALA_RESGATE:
                     parar()
-                    print("resgate imediatamente")
+                    print(f"[SALA DE RESGATE] Gap continuo por mais de {TEMPO_GAP_SALA_RESGATE:.0f}s, entrando no resgate")
                     time.sleep(3.0)
                     area(contours)
                     break
@@ -1474,21 +1618,29 @@ def loop_principal():
 
 _serial_thread_iniciada = [False]
 
-
+robo_ativo.set()
+angulo(150)
+angulo(0)
+if "--auto" in sys.argv:
+    # ja comeca ativo (vindo do resgate) - servo pesado levantado
+    mover_servo(PINO_PESADO, SERVO_PESADO_ANGULO_ATIVO, 100)
+else:
+    # esperando o botao pra comecar - servo pesado abaixado, indicando parado
+    mover_servo(PINO_PESADO, SERVO_PESADO_ANGULO_PARADO, 100)
+    robo_ativo.clear()
 def iniciar_hardware():
     
     global cap
 
     t_mpu = Thread(target=iniciar_mpu)
     t_mpu.start()
-    t_yolo = Thread(target=carregar_modelo_vitima)
-    t_yolo.start()
+    # modelo de vitima NAO carrega no boot do seguidor - so quando
+    # identificar_vitimas() for chamada de verdade (carregamento preguicoso)
 
     handshake_serial()      # serial primeiro, igual no codigo original
     cap = iniciar_camera()  # so a camera de LINHA e aberta no boot
 
     t_mpu.join()
-    t_yolo.join()
     print("[BOOT] Hardware pronto")
 
 
@@ -1504,6 +1656,7 @@ if __name__ == "__main__":
             try:
                 robo_ativo.wait()
                 loop_principal()
+                
                 #mover(50 , 50)
 
                 

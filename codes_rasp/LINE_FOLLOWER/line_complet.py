@@ -14,6 +14,8 @@ Mudancas de comportamento pedidas (nao sao bugfix, sao features novas):
   5) Erros inesperados no loop principal nao derrubam o programa: sao
      logados e o robo tenta rodar de novo (retry). Isso completa o
      Restart=always do systemd (ver robo_dogo.service).
+  6) Reset de USB via software (ioctl USBDEVFS_RESET) quando uma camera
+     falha ao abrir ou trava - nao precisa tirar/colocar o cabo na mao.
 """
 
 import cv2
@@ -24,9 +26,19 @@ import serial
 import math
 import serial.tools.list_ports
 import sys
+import os
+import fcntl
+import subprocess
 import smbus2
 import threading
 from threading import Thread
+
+try:
+    from ultralytics import YOLO
+    YOLO_DISPONIVEL = True
+except ImportError:
+    YOLO_DISPONIVEL = False
+    print("[VITIMA][AVISO] ultralytics nao instalado, deteccao de vitima desativada")
 
 # =========================================================================
 # EXCECAO DE PARADA IMEDIATA
@@ -36,7 +48,18 @@ class RoboParado(Exception):
     pass
 
 robo_ativo = threading.Event()
-robo_ativo.set()  # comeca ligado
+ENTREGAS_HERDADAS = 0
+if "--auto" in sys.argv:
+    robo_ativo.set()
+else:
+    robo_ativo.clear()
+
+for arg in sys.argv[1:]:
+    if arg.startswith("--entregas="):
+        try:
+            ENTREGAS_HERDADAS = int(arg.split("=", 1)[1])
+        except ValueError:
+            ENTREGAS_HERDADAS = 0
 
 def checar_parada():
     """Chamar a cada iteracao de todo while True que segura o robo por mais
@@ -48,16 +71,16 @@ def checar_parada():
 # =========================================================================
 # CONFIG (NAO ALTERADO)
 # =========================================================================
-Kp = 1.6
-Kd = 0.7
-VEL_BASE = 25
-VEL_MAX  = 50
+Kp = 1.8 #1.6, 1,9
+Kd = 0.7 # 0.7, 0.5, 0.9
+VEL_BASE = 25 #20, 25
+VEL_MAX  = 50 #45
 VEL_MIN  = -VEL_MAX
 VEL_GAP  = 25
 LIMIAR   = 80
-DEADZONE = 8
+DEADZONE =5 # 8, 0
 AREA_MIN = 11000
-
+TCRT = 6  # GPIO BCM 5
 IN1, IN2, ENA = 17, 18, 12
 IN3, IN4, ENB = 22, 23, 13
 BUTTON = 24
@@ -82,6 +105,21 @@ camera_y = 120
 SHOW_PREVIEW    = True
 PREVIEW_EVERY_N = 3
 PREVIEW_VERDE_EVERY_N = 3
+
+CAMERA_LINHA_PATH  = None  
+CAMERA_VITIMA_PATH = None  
+CAMERA_LINHA_INDEX_FALLBACK  = 0
+CAMERA_VITIMA_INDEX_FALLBACK = 2
+
+VICTIM_MODEL_PATH   = "modelon.onnx"
+VICTIM_CROP_W, VICTIM_CROP_H = 320, 240
+VICTIM_CONF_THRES   = 0.35
+VICTIM_FRAMES_WARMUP = 3
+VICTIM_FRAMES_ANALISE = 30
+DEBUG_VITIMA_PREVIEW =True
+
+# --- RESET DE USB VIA SOFTWARE ---
+USB_RESET_TENTATIVAS_ANTES_DE_RESETAR = 3  # falhas seguidas antes de tentar resetar USB
 
 
 # =========================================================================
@@ -111,10 +149,6 @@ def resetar_estado():
     _preview_verde_contador = 0
     resetar_giroscopio()
 
-# valores iniciais - NAO chama resetar_estado() aqui pq ela depende de
-# resetar_giroscopio(), que so existe depois (secao do MPU la embaixo).
-# resetar_estado() de verdade e chamada dentro de loop_principal(), quando
-# tudo (GPIO, MPU, etc) ja foi inicializado.
 tempo_sem_linha = 0
 girando = False
 gangorra = 0
@@ -137,6 +171,7 @@ _preview_verde_contador = 0
 # =========================================================================
 h = GPIO.gpiochip_open(0)
 GPIO.gpio_claim_input(h, BUTTON, GPIO.SET_PULL_UP)
+GPIO.gpio_claim_input(h, TCRT)
 pins = [IN1, IN2, IN3, IN4, ENA, ENB]
 for p in pins:
     GPIO.gpio_claim_output(h, p)
@@ -169,6 +204,8 @@ def parar():
     mover(0, 0)
 
 
+def sensor_e():
+    return GPIO.gpio_read(h, TCRT) 
 # =========================================================================
 # BOTAO - thread dedicada, toggle com debounce
 # =========================================================================
@@ -177,7 +214,7 @@ def botao_thread():
     while True:
         estado = GPIO.gpio_read(h, BUTTON)
         if estado == 1 and anterior == 0:
-            time.sleep(0.03)  # debounce
+            time.sleep(0.03)
             if GPIO.gpio_read(h, BUTTON) == 1:
                 if robo_ativo.is_set():
                     robo_ativo.clear()
@@ -186,7 +223,6 @@ def botao_thread():
                 else:
                     print("[BOTAO] REINICIANDO...")
                     robo_ativo.set()
-                # espera soltar o botao antes de aceitar novo toque
                 while GPIO.gpio_read(h, BUTTON) == 1:
                     time.sleep(0.02)
         anterior = estado
@@ -194,8 +230,8 @@ def botao_thread():
 
 
 # =========================================================================
-# MPU6050 DIRETO NA RASP (NAO ALTERADO NA LOGICA)
-# =========================================================================
+# MPU6050 DIRETO NA RASP 
+# =======================================================================
 _gyro_lock = threading.Lock()
 MPU_ADDR    = 0x68
 GYRO_XOUT_H = 0x43
@@ -208,13 +244,24 @@ gyro_ultimo_tempo = time.time()
 def _mpu_write(reg, val):
     bus.write_byte_data(MPU_ADDR, reg, val)
 
-def _mpu_read_word(reg):
-    hi = bus.read_byte_data(MPU_ADDR, reg)
-    lo = bus.read_byte_data(MPU_ADDR, reg + 1)
-    val = (hi << 8) | lo
-    if val >= 0x8000:
-        val -= 65536
-    return val
+def _mpu_read_word(reg, tentativas=3):
+    for tentativa in range(tentativas):
+        try:
+            hi = bus.read_byte_data(MPU_ADDR, reg)
+            lo = bus.read_byte_data(MPU_ADDR, reg + 1)
+
+            valor = (hi << 8) | lo
+
+            if valor >= 0x8000:
+                valor -= 65536
+
+            return valor
+
+        except OSError as e:
+            # Remote I/O error (121), muito comum em impactos
+            if tentativa == tentativas - 1:
+                raise
+            time.sleep(0.001)
 
 def _normalizar(ang):
     while ang > 180: ang -= 360
@@ -239,7 +286,7 @@ def resetar_giroscopio():
         gyro_ultimo_tempo = time.time()
 
 def angulo_x(): return int(ang_gyro["X"])
-def angulo_y(): return int(ang_gyro["Y"])
+def angulo_y(): return angulo_y_estavel()
 def angulo_z(): return int(ang_gyro["Z"])
 
 def _gyro_thread():
@@ -260,12 +307,15 @@ def _gyro_thread():
                 ang_gyro["X"] = _normalizar(ang_gyro["X"] + gx * dt)
                 ang_gyro["Y"] = _normalizar(ang_gyro["Y"] + gy * dt)
                 ang_gyro["Z"] = _normalizar(ang_gyro["Z"] + gz * dt)
-        except Exception:
-            pass
-        time.sleep(0.005)
+        except OSError as e:
+            print(f"[MPU] Gyro I2C: {e}")
+            time.sleep(0.005)
+
+        except Exception as e:
+            print(f"[MPU] Gyro: {e}")
+            time.sleep(0.005)
 
 def iniciar_mpu():
-    """Configura + calibra o MPU. Chamada em paralelo com serial/camera no boot."""
     _mpu_write(0x6B, 0x00)
     time.sleep(0.05)
     _mpu_write(0x1B, 0x00)
@@ -283,6 +333,49 @@ def iniciar_mpu():
 dados = {"F": 9999.0, "E": 9999.0}
 ultimo_recebimento = time.time()
 ser = None
+
+
+
+# ==========================================================
+# �NGULO Y EST�VEL (RAMPA/GANGORRA)
+# Usa somente o aceler�metro + filtro exponencial
+# ==========================================================
+
+ACCEL_XOUT_H = 0x3B
+ACCEL_YOUT_H = 0x3D
+ACCEL_ZOUT_H = 0x3F
+
+_angulo_y_filtrado = None
+
+def angulo_y_estavel(alpha=0.97):
+    global _angulo_y_filtrado
+
+    try:
+        ax = _mpu_read_word(ACCEL_XOUT_H) / 16384.0
+        ay = _mpu_read_word(ACCEL_YOUT_H) / 16384.0
+        az = _mpu_read_word(ACCEL_ZOUT_H) / 16384.0
+
+        angulo = math.degrees(
+            math.atan2(-ax, math.sqrt(ay * ay + az * az))
+        )
+
+        if _angulo_y_filtrado is None:
+            _angulo_y_filtrado = angulo
+        else:
+            _angulo_y_filtrado = (
+                alpha * _angulo_y_filtrado
+                + (1 - alpha) * angulo
+            )
+
+    except OSError as e:
+        print(f"[MPU] Falha I2C ({e}), mantendo último valor.")
+        # NÃO derruba o programa
+
+    if _angulo_y_filtrado is None:
+        return 0
+
+    return int(_angulo_y_filtrado)
+
 
 def detectar_porta(sair_se_falhar=True):
     try:
@@ -320,8 +413,6 @@ def detectar_porta(sair_se_falhar=True):
     return None
 
 def aguardar_porta(intervalo=1.0):
-    """Fica tentando ate o Arduino aparecer na USB (util no boot automatico,
-    quando o Python sobe antes do Arduino terminar de enumerar)."""
     porta = detectar_porta(sair_se_falhar=False)
     while porta is None:
         print("[Serial] Arduino ainda nao apareceu, tentando de novo...")
@@ -330,9 +421,6 @@ def aguardar_porta(intervalo=1.0):
     return porta
 
 def handshake_serial():
-    """Abre a porta e faz o handshake START. Mantido com os mesmos tempos
-    do codigo original (2s + 2s) porque cortar isso deixava o Arduino
-    'meio pronto' e causava perda de dado logo no inicio."""
     global ser
     global ultimo_recebimento
     ser = aguardar_porta()
@@ -357,14 +445,12 @@ def serial_thread():
                         ser.reset_input_buffer()
                     except Exception:
                         pass
-                    ultimo_recebimento = time.time()  # evita reconectar em loop logo apos religar
+                    ultimo_recebimento = time.time()
                     print("[SERIAL] Reconectado!")
                 else:
                     time.sleep(1.0)
                 continue
 
-            # WATCHDOG: porta continua "aberta" mas o Arduino parou de mandar
-            # dado (travou, buffer sujo, etc). Forca reconexao.
             if time.time() - ultimo_recebimento > WATCHDOG_RECONEXAO:
                 print(f"[SERIAL] Sem dado novo ha mais de {WATCHDOG_RECONEXAO:.0f}s, forcando reconexao...")
                 try:
@@ -419,29 +505,234 @@ def sonar_valido():
 
 
 # =========================================================================
+# RESET DE USB VIA SOFTWARE (sem tirar/colocar cabo)
+# =========================================================================
+USBDEVFS_RESET = 21780  # 0x5514 -> _IO('U', 20), constante do kernel Linux
+
+def _achar_bus_dev(video_path):
+    nome = os.path.basename(os.path.realpath(video_path))
+    sys_dev = f"/sys/class/video4linux/{nome}/device"
+    d = os.path.realpath(sys_dev)
+    for _ in range(8):
+        busnum_f = os.path.join(d, "busnum")
+        devnum_f = os.path.join(d, "devnum")
+        if os.path.exists(busnum_f) and os.path.exists(devnum_f):
+            with open(busnum_f) as f:
+                busnum = int(f.read().strip())
+            with open(devnum_f) as f:
+                devnum = int(f.read().strip())
+            return busnum, devnum
+        novo_d = os.path.dirname(d)
+        if novo_d == d:
+            break
+        d = novo_d
+    return None, None
+
+def resetar_usb_camera(video_path_ou_indice):
+    
+    if isinstance(video_path_ou_indice, int):
+        video_path = f"/dev/video{video_path_ou_indice}"
+    else:
+        video_path = video_path_ou_indice
+
+    ok = False
+    try:
+        busnum, devnum = _achar_bus_dev(video_path)
+        if busnum is not None:
+            usb_node = f"/dev/bus/usb/{busnum:03d}/{devnum:03d}"
+            fd = os.open(usb_node, os.O_WRONLY)
+            try:
+                fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+                print(f"[USB] Reset via ioctl OK em {usb_node} (camera {video_path})")
+                ok = True
+            finally:
+                os.close(fd)
+        else:
+            print(f"[USB][AVISO] Nao achei bus/dev USB pra {video_path}")
+    except PermissionError:
+        print("[USB][ERRO] Sem permissao pra resetar USB (roda como root ou "
+              "cria regra de udev liberando /dev/bus/usb/*)")
+    except Exception as e:
+        print("[USB][ERRO] Falha no reset via ioctl:", e)
+
+    try:
+        subprocess.run(["uhubctl"], capture_output=True, timeout=2)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    time.sleep(1.0)
+    return ok
+
+
+# =========================================================================
 # CAMERA
 # =========================================================================
+def _abrir_camera(fonte):
+    cap_local = cv2.VideoCapture(fonte, cv2.CAP_V4L2)
+    if cap_local.isOpened():
+        ret, _ = cap_local.read()
+        if ret:
+            return cap_local
+        cap_local.release()
+    return None
+
 def detectar_camera():
+    if CAMERA_LINHA_PATH:
+        c = _abrir_camera(CAMERA_LINHA_PATH)
+        if c is not None:
+            print(f"[Camera] Linha conectada em {CAMERA_LINHA_PATH}")
+            return c
+
+    c = _abrir_camera(CAMERA_LINHA_INDEX_FALLBACK)
+    if c is not None:
+        print(f"[Camera] Linha conectada no indice {CAMERA_LINHA_INDEX_FALLBACK}")
+        return c
+
     for i in range(10):
-        cap_local = cv2.VideoCapture(i, cv2.CAP_V4L2)
-        if cap_local.isOpened():
-            ret, _ = cap_local.read()
-            if ret:
-                print(f"[Camera] Conectada em /dev/video{i}")
-                return cap_local
-            cap_local.release()
+        c = _abrir_camera(i)
+        if c is not None:
+            print(f"[Camera] Linha conectada em /dev/video{i}")
+            return c
     return None
 
 def iniciar_camera():
+    tentativas = 0
     cap_local = detectar_camera()
     while cap_local is None:
-        print("[Camera] Tentando novamente em 1s...")
+        tentativas += 1
+        print(f"[Camera] Tentando novamente em 1s... (tentativa {tentativas})")
         time.sleep(1)
+        if tentativas % USB_RESET_TENTATIVAS_ANTES_DE_RESETAR == 0:
+            print("[Camera] Varias falhas seguidas, tentando resetar USB...")
+            resetar_usb_camera(CAMERA_LINHA_PATH or CAMERA_LINHA_INDEX_FALLBACK)
         cap_local = detectar_camera()
     cap_local.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap_local.set(3, camera_x)
     cap_local.set(4, camera_y)
     return cap_local
+
+
+# =========================================================================
+# CAMERA DE VITIMAS (YOLO ONNX) - so aberta durante o resgate
+# =========================================================================
+modelo_vitima = None
+
+def carregar_modelo_vitima():
+    global modelo_vitima
+    if not YOLO_DISPONIVEL:
+        return
+    try:
+        print("[VITIMA] Carregando modelo YOLO...")
+        modelo_vitima = YOLO(VICTIM_MODEL_PATH)
+        print("[VITIMA] Modelo pronto")
+    except Exception as e:
+        print("[VITIMA][ERRO] Falha ao carregar modelo:", e)
+        modelo_vitima = None
+
+def _abrir_camera_vitima():
+    fonte_principal = CAMERA_VITIMA_PATH or CAMERA_VITIMA_INDEX_FALLBACK
+    c = _abrir_camera(fonte_principal)
+    if c is not None:
+        return c
+
+    print("[VITIMA][AVISO] Camera de vitima nao respondeu, tentando resetar USB...")
+    resetar_usb_camera(fonte_principal)
+
+    c = _abrir_camera(fonte_principal)
+    if c is not None:
+        return c
+
+    if CAMERA_VITIMA_PATH:
+        return _abrir_camera(CAMERA_VITIMA_INDEX_FALLBACK)
+    return None
+
+def identificar_vitimas():
+    """Abre a 2a camera, roda a inferencia YOLO em alguns frames e fecha.
+    Retorna lista de deteccoes: [{"classe": str, "conf": float}, ...]
+    Chamada dentro de area() assim que o robo entra na area de resgate."""
+    if not YOLO_DISPONIVEL:
+        print("[VITIMA] YOLO indisponivel, pulando deteccao")
+        return []
+
+    if modelo_vitima is None:
+        carregar_modelo_vitima()  # carregamento preguicoso, so na primeira chamada
+
+    if modelo_vitima is None:
+        print("[VITIMA] Modelo indisponivel, pulando deteccao")
+        return []
+
+    cap_vitima = _abrir_camera_vitima()
+    if cap_vitima is None:
+        print("[VITIMA][ERRO] Nao foi possivel abrir a camera de vitima")
+        return []
+
+    deteccoes = {}
+    try:
+        for _ in range(VICTIM_FRAMES_WARMUP):
+            cap_vitima.read()
+
+        for _ in range(VICTIM_FRAMES_ANALISE):
+            checar_parada()
+            ret, frame = cap_vitima.read()
+            if not ret or frame is None:
+                continue
+
+            fh, fw = frame.shape[:2]
+            start_x = max(fw // 2 - VICTIM_CROP_W // 2, 0)
+            start_y = max(fh // 2 - VICTIM_CROP_H // 2, 0)
+            cropped = frame[start_y:start_y + VICTIM_CROP_H, start_x:start_x + VICTIM_CROP_W]
+
+            inicio = time.perf_counter()
+
+            results = modelo_vitima.predict(
+                cropped,
+                imgsz=(VICTIM_CROP_W, VICTIM_CROP_H),
+                conf=VICTIM_CONF_THRES,
+                verbose=False
+            )
+
+            tempo = time.perf_counter() - inicio
+            fps_modelo = 1.0 / tempo
+
+            results = modelo_vitima.predict(
+                cropped, imgsz=(VICTIM_CROP_W, VICTIM_CROP_H),
+                conf=VICTIM_CONF_THRES, verbose=False
+            )
+
+            for box in results[0].boxes:
+                classe = results[0].names[int(box.cls[0])]
+                conf = float(box.conf[0])
+                if classe not in deteccoes or conf > deteccoes[classe]:
+                    deteccoes[classe] = conf
+
+            if DEBUG_VITIMA_PREVIEW:
+                annotated = results[0].plot()
+
+                cv2.putText(
+                annotated,
+                f"YOLO FPS: {fps_modelo:.1f}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2
+                )
+                cv2.imshow("Deteccao Vitima", annotated)
+                cv2.waitKey(1)
+
+    finally:
+        cap_vitima.release()
+        if DEBUG_VITIMA_PREVIEW:
+            cv2.destroyWindow("Deteccao Vitima")
+
+    lista = [{"classe": c, "conf": v} for c, v in deteccoes.items()]
+    if lista:
+        print(f"[VITIMA] Detectado: {lista}")
+    else:
+        print("[VITIMA] Nenhuma vitima detectada")
+    return lista
 
 
 # =========================================================================
@@ -678,10 +969,6 @@ def mostrar_preview_verde(roi):
     cv2.waitKey(1)
 
 
-# =========================================================================
-# MANOBRAS (guinadas, desvio, resgate) - checar_parada() inserido em todo
-# while True pra permitir parada imediata pelo botao
-# =========================================================================
 def guinada2(LADO, GRAUS, VELOCIDADE):
     resetar_giroscopio()
     time.sleep(0.1)
@@ -831,29 +1118,17 @@ def girar_ate_linha(direcao, velocidade=60, tolerancia=40, timeout=5.0):
 
 def area(contours):
     print("estou na area")
-    mover(-19, -19)
-    time.sleep(0.09)
-    maior = max(contours, key=cv2.contourArea)
-
-    while True:
-        checar_parada()
-        mover(25, 25)
-        if distancia_frente() <= 6 or (len(contours) == 1 and cv2.contourArea(maior) > AREA_MIN):
-            mover(-10, -10)
-            time.sleep(0.09)
-            if distancia_frente() <= 6:
-                guinada2("E", 45, 40)
-            if len(contours) == 1 and cv2.contourArea(maior) > AREA_MIN:
-                mover(-10, -10)
-                time.sleep(0.09)
-            break
-        time.sleep(0.01)
-
+    os.execv(sys.executable, [
+        sys.executable,
+        "/home/pi/ROBO_DOGO_2026/codes_rasp/PROTOTIPAGEM_LINE/resgate.py",
+        f"--entregas={ENTREGAS_HERDADAS}",
+    ])
 
 def desvio():
     if distancia_frente() <= 6:
         time.sleep(0.09)
         if distancia_frente() <= 5:
+            mover(30, 30)
             mover(-30, -30)
             time.sleep(0.2)
             mover(-10, -10)
@@ -920,6 +1195,7 @@ def desvio():
 
 
 def verde(roi):
+   
     acao_verde = detectar_verde(roi)
     if not acao_verde:
         return
@@ -946,12 +1222,13 @@ def verde(roi):
 
     acao_verde = acao_confirmada
     parar()
+  
 
     if acao_verde == "ESQUERDA":
         mover(-10, -10)
         time.sleep(0.1)
         mover(30, 30)
-        time.sleep(0.15)
+        time.sleep(0.18)
         parar()
         guinada2('E', 85, 40)
         inicio = time.time()
@@ -968,7 +1245,7 @@ def verde(roi):
         mover(-10, -10)
         time.sleep(0.1)
         mover(30, 30)
-        time.sleep(0.15)
+        time.sleep(0.18)
         parar()
         guinada2('D', 85, 40)
         inicio = time.time()
@@ -984,7 +1261,7 @@ def verde(roi):
         print("gira 180")
         mover(-12, -12)
         time.sleep(0.09)
-        guinada_pid("D", 175)
+        guinada_pid("D", 170)
         mover(30, 30)
         time.sleep(0.19)
         mover(-10, -10)
@@ -1084,7 +1361,7 @@ def detectar_travamento(roi):
 # =========================================================================
 def controle(cx, contours, roi):
     global ultimo_erro, ultimo_tempo, em_rampa, contador_gangorra
-
+    
     w = roi.shape[1]
     tempo_atual = time.time()
     dt = tempo_atual - ultimo_tempo
@@ -1106,30 +1383,33 @@ def controle(cx, contours, roi):
     derivada = np.clip(derivada, -300, 300)
     ajuste = (Kp * erro) + (Kd * derivada)
 
-    if -5 < angulo_y() < 5:
+    print("angulo y ",angulo_y())
+    if -5 < angulo_y() < 3 and contador_gangorra != 2:
         contador_gangorra = 0
 
-    if angulo_y() <= -10:
-        velocidade_base = 60
+    
+    if angulo_y() <= -16:
+        contador_gangorra = 2
+        velocidade_base = 45
         velL = np.clip(velocidade_base + ajuste, 20, 100)
         velR = np.clip(velocidade_base - ajuste, 20, 100)
-        #print("gangoraaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-    elif angulo_y() >= 14 and contador_gangorra == 0:
-        contador_gangorra = 1
-        mover(-10, -10)
-        time.sleep(1.0)
-        mover(-40, -40)
-        time.sleep(0.3)
-        velocidade_base = 20
-        velL = velocidade_base + ajuste
-        velR = velocidade_base - ajuste
     else:
         velocidade_base = VEL_BASE
         velL = np.clip(velocidade_base + ajuste, VEL_MIN, VEL_MAX)
         velR = np.clip(velocidade_base - ajuste, VEL_MIN, VEL_MAX)
-
+    if angulo_y() >= -3 and contador_gangorra == 2:
+        print("descendo gangorra ")
+        contador_gangorra = 1
+        mover(-10, -10)
+        time.sleep(1.0)
+        mover(-40, -40)
+        time.sleep(0.6)
+        velocidade_base = 20
+        velL = velocidade_base + ajuste
+        velR = velocidade_base - ajuste
     mover(velL, velR)
     ultimo_erro = erro
+
     ultimo_tempo = tempo_atual
     return ajuste, contours
 
@@ -1137,31 +1417,73 @@ def controle(cx, contours, roi):
 # =========================================================================
 # LOOP PRINCIPAL
 # =========================================================================
+FALHAS_CAMERA_ANTES_DE_RESETAR = 15  # ~ alguns segundos de frames perdidos seguidos
+
+def achar_saida():
+    while True :
+        mover(-40,40)
+        time.sleep(0.1)
+        mover(5,-5)
+        time.sleep(0.3)
+        print("distancia",distancia_frente())
+        if distancia_frente() > 70:
+            while True :
+                mover(25,25)
+                print("cor", sensor_e)
+                if distancia_frente()< 50:
+                    mover(25,25)  
+                    time.sleep(0.6)
+                    break
+                if sensor_e () == 1 or distancia_esquerda()> 70 :
+                    mover(-10,-10)
+                    time.sleep(5.0)
+                    break
+                
+            print("achei potencial saida ")
+            mover(0,0)
+            time.sleep(2.0)
+            break
 def loop_principal():
-    global ultimo_erro, ultimo_tempo
+    global ultimo_erro, ultimo_tempo, cap
     resetar_estado()
     parar()
     Thread(target=serial_thread, daemon=True).start() if not _serial_thread_iniciada[0] else None
     _serial_thread_iniciada[0] = True
+
+    falhas_camera_seguidas = 0
 
     while True:
         checar_parada()
 
         ret, frame = cap.read()
         if not ret:
+            falhas_camera_seguidas += 1
+            if falhas_camera_seguidas >= FALHAS_CAMERA_ANTES_DE_RESETAR:
+                print("[Camera] Linha de camera parou de responder, resetando USB...")
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                resetar_usb_camera(CAMERA_LINHA_PATH or CAMERA_LINHA_INDEX_FALLBACK)
+                cap = iniciar_camera()
+                falhas_camera_seguidas = 0
             continue
-
+        falhas_camera_seguidas = 0
+        #print("ANGULO Y ", angulo_y())
+        #print("ULTRA", distancia_frente())
+        print("distancai fren", distancia_frente())
+            
         if detectar_fita_vermelha(frame):
             continue
 
         cx, contours, roi, mask = visao(frame)
 
-        if detectar_travamento(roi):
+        """if detectar_travamento(roi):
             print("[TRAVAMENTO] Tentando se soltar...")
             while True:
                 checar_parada()
                 mover(100, 100)
-                time.sleep(0.2)
+                time.sleep(0.3)
                 ret, frame_trav = cap.read()
                 if ret:
                     _, _, roi_trav, _ = visao(frame_trav)
@@ -1170,13 +1492,14 @@ def loop_principal():
                         parar()
                         ultimo_erro = 0
                         ultimo_tempo = time.time()
-                break
+                break"""
 
-        verde(roi)
-        ajuste, contours = controle(cx, contours, roi)
-        desvio()
+        #verde(roi)
+        #ajuste, contours = controle(cx, contours, roi)
+        #desvio()
+        achar_saida()
 
-        if gap_debug(contours) and distancia_esquerda() < 20:
+        """if gap_debug(contours) and distancia_esquerda() < 20:
             inicio_gap = time.time()
             while True:
                 checar_parada()
@@ -1193,7 +1516,7 @@ def loop_principal():
                     time.sleep(3.0)
                     area(contours)
                     break
-                mover(VEL_GAP, VEL_GAP)
+                mover(VEL_GAP, VEL_GAP)"""
 
         if cv2.waitKey(1) == 27:
             break
@@ -1202,28 +1525,22 @@ def loop_principal():
 _serial_thread_iniciada = [False]
 
 
-# =========================================================================
-# BOOT - camera, serial e MPU em paralelo pra iniciar mais rapido
-# =========================================================================
 def iniciar_hardware():
-    """MPU roda em paralelo (I2C, barramento proprio, sem conflito).
-    Serial e camera ficam SEQUENCIAIS: paralelizar os dois fazia os dois
-    disputarem a USB ao mesmo tempo e a deteccao do Arduino ficava instavel."""
+    
     global cap
 
     t_mpu = Thread(target=iniciar_mpu)
     t_mpu.start()
+    # modelo de vitima NAO carrega no boot do seguidor - so quando
+    # identificar_vitimas() for chamada de verdade (carregamento preguicoso)
 
     handshake_serial()      # serial primeiro, igual no codigo original
-    cap = iniciar_camera()  # camera so depois da serial estar resolvida
+    cap = iniciar_camera()  # so a camera de LINHA e aberta no boot
 
     t_mpu.join()
     print("[BOOT] Hardware pronto")
 
 
-# =========================================================================
-# MAIN
-# =========================================================================
 if __name__ == "__main__":
     t0 = time.time()
     iniciar_hardware()
@@ -1236,24 +1553,23 @@ if __name__ == "__main__":
             try:
                 robo_ativo.wait()
                 loop_principal()
-                #print("ANGULO Y", angulo_y())
+                
+                #mover(50 , 50)
 
-            except RoboParado:
-                parar()
-                print("[SISTEMA] Robo parado. Aguardando novo aperto do botao...")
-                robo_ativo.wait()
+                
+
+            except KeyboardInterrupt:
+                print("Finalizado")
+                break
+
+            except OSError as e:
+                print("[MPU] Erro I2C:", repr(e))
+                time.sleep(0.01)
                 continue
 
             except Exception as e:
-                # erro inesperado no meio do loop: nao mata o processo,
-                # para o robo com seguranca e tenta de novo
-                print("[ERRO] loop principal falhou:", repr(e))
+                print("[ERRO] loop principal:", repr(e))
                 parar()
-                time.sleep(0.5)
-                continue
-
-    except KeyboardInterrupt:
-        print("Finalizado")
 
     finally:
         parar()
@@ -1263,7 +1579,3 @@ if __name__ == "__main__":
         except Exception:
             pass
         cv2.destroyAllWindows()
-
-
-
-        """codigo mais estavvel  antes dee comecar concertar as coisas pra fazer o resggate, como reiniciar a camera e tals """
