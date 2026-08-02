@@ -110,9 +110,9 @@ def limpar_camera(n=5):
 # =========================================================================
 # CONTROLE (segue linha) - PID
 # =========================================================================
-Kp = 0.35 #1.6, 1,9
-Kd = 0.3 # 0.73 22.5, 0.9
-VEL_BASE = 15 #20, 25
+Kp = 0.35 #0.35
+Kd = 0.3 # 0.3
+VEL_BASE = 15 #15
 DEADZONE = 5 # 8, 0
 
 contador_gangorra = 0
@@ -192,6 +192,7 @@ black_min     = np.array([0, 0, 0])
 black_max_top = np.array([90, 90, 90])
 black_max_bot = np.array([135, 135, 135])
 MIN_GREEN_AREA = 2500
+LIMIAR_PIXELS_VERDE_OUTRO_LADO = 2000  # verde do lado oposto acima disso = pode ser o 2o marcador do 180 comecando a aparecer
 
 DEBUG_VERDE = True
 DEBUG_SEM_ACAO = False
@@ -289,7 +290,7 @@ def check_green(contours_grn, black_image, green_image):
 
     turn_left, turn_right, turn_180 = determine_turn_direction(black_around_sign, green_centers)
     pixels_verde = cv2.countNonZero(green_image)
-    print(pixels_verde)
+    print("pixel verde", pixels_verde)
 
     contador_180 = contador_180 + 1 if turn_180 else 0
     contador_esquerda = contador_esquerda + 1 if turn_left else 0
@@ -303,6 +304,15 @@ def check_green(contours_grn, black_image, green_image):
         return "DIREITA"
     else:
         return "RETO"
+    
+    """if turn_180:
+        return "GIRAR_180"
+    elif turn_left :
+        return "ESQUERDA"
+    elif turn_right :
+        return "DIREITA"
+    else:
+        return "RETO"""
 
 
 def detectar_verde(roi):
@@ -400,7 +410,7 @@ def verde(roi):
 
     if acao_verde == "ESQUERDA":
         config.mover(-2, -2)
-        time.sleep(0.1)
+        time.sleep(0.9)
         config.mover(15, 15)
         time.sleep(0.25)
         config.parar()
@@ -419,7 +429,7 @@ def verde(roi):
     elif acao_verde == "DIREITA":
         limpar_camera(10)
         config.mover(-2, -2)
-        time.sleep(0.1)
+        time.sleep(0.9)
         config.mover(15, 15)
         time.sleep(0.25)
         config.parar()
@@ -438,7 +448,7 @@ def verde(roi):
     elif acao_verde == "GIRAR_180":
         print("gira 180")
         config.mover(-2, -2)
-        time.sleep(0.09)
+        time.sleep(0.3)
         movimentos_bases.guinada2("D", 170, 20)
         config.mover(15, 15)
         time.sleep(0.22)
