@@ -110,10 +110,10 @@ def limpar_camera(n=5):
 # =========================================================================
 # CONTROLE (segue linha) - PID
 # =========================================================================
-Kp = 0.35 #0.35
+Kp = 0.7 #0.9
 Kd = 0.3 # 0.3
 VEL_BASE = 15 #15
-DEADZONE = 5 # 8, 0
+DEADZONE = 0 # 8, 0
 
 contador_gangorra = 0
 ultimo_erro = 0
@@ -150,15 +150,67 @@ def controle(cx, contours, roi):
     else:
         ajuste = (Kp * erro) + (Kd * derivada)
 
-    print("angulo y ", config.angulo_y())
+    print("angulo y ", config.angulo_y(), " | angulo z ", config.angulo_z())
     if -5 < config.angulo_y() < 3 and contador_gangorra != 2:
         contador_gangorra = 0
 
-    if config.angulo_y() <= -16:
+    # Muito verde na ROI (perto de um marcador de curva) - diminui a
+    # velocidade pra dar mais estabilidade na hora de decidir a curva em
+    # vez de passar correndo por cima do marcador.
+    hsv_ctrl = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask_verde_ctrl = cv2.inRange(hsv_ctrl, green_min, green_max)
+    pixels_verde_ctrl = cv2.countNonZero(mask_verde_ctrl)
+
+    if config.angulo_y() <= -13:
         contador_gangorra = 2
-        velocidade_base = 20
+        velocidade_base = 25
         velL = np.clip(velocidade_base + ajuste, config.VEL_MIN, config.VEL_MAX)
         velR = np.clip(velocidade_base - ajuste, config.VEL_MIN, config.VEL_MAX)
+    elif pixels_verde_ctrl > 9000:
+        print(f"[VERDE-CONTROLE] pixels_verde={pixels_verde_ctrl} - freando")
+        velocidade_base = 10
+        velL = np.clip(velocidade_base + ajuste, -12, 12)
+        velR = np.clip(velocidade_base - ajuste, -12, 12)
+        if pixels_verde_ctrl > 22000:
+            print("gira 180")
+            config.mover(-2, -2)
+            time.sleep(0.3)
+            movimentos_bases.guinada2("D", 170, 20)
+            config.mover(15, 15)
+            time.sleep(0.22)
+            config.mover(-2, -2)
+            time.sleep(0.2)
+            config.parar()
+            limpar_camera(10)
+        """if pixels_verde_ctrl > 22000:
+            print(f"[VERDE-CONTROLE] pixels_verde={pixels_verde_ctrl} - muito perto/parado, recuando")
+            inicio_caso_verde = time.time()
+            while time.time() - inicio_caso_verde < 2.0:
+                config.checar_parada()
+                ret_cv, frame_cv = config.cap.read()
+                if not ret_cv:
+                    continue
+                _, _, roi_cv, _ = visao(frame_cv)
+                hsv_cv = cv2.cvtColor(roi_cv, cv2.COLOR_BGR2HSV)
+                mask_cv = cv2.inRange(hsv_cv, green_min, green_max)
+                contornos_cv, _ = cv2.findContours(mask_cv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                contornos_grandes_cv = [c for c in contornos_cv if cv2.contourArea(c) > MIN_GREEN_AREA]
+
+                if len(contornos_grandes_cv) >= 2:
+                    caso_verde_cv = "verde verde"
+                elif contador_180 > 0:
+                    caso_verde_cv = "180"
+                elif contador_direita > contador_esquerda:
+                    caso_verde_cv = "direita"
+                elif contador_esquerda > contador_direita:
+                    caso_verde_cv = "esquerda"
+                else:
+                    caso_verde_cv = "reto"
+
+                print(f"[VERDE-CONTROLE] processando caso: {caso_verde_cv}")
+                if caso_verde_cv != "reto":
+                    verde(roi_cv)
+                    break"""
     else:
         velocidade_base = VEL_BASE
         velL = np.clip(velocidade_base + ajuste, config.VEL_MIN, config.VEL_MAX)
@@ -175,7 +227,7 @@ def controle(cx, contours, roi):
         velocidade_base = 20
         velL = velocidade_base + ajuste
         velR = velocidade_base - ajuste
-
+    
     config.mover(velL, velR)
     ultimo_erro = erro
 
@@ -186,13 +238,13 @@ def controle(cx, contours, roi):
 # =========================================================================
 # DETECCAO DE MARCADOR VERDE
 # =========================================================================
-green_min = np.array([40, 50, 45])
-green_max = np.array([85, 255, 255])
+green_min = np.array([17, 48, 39]) #40, 50, 45
+green_max = np.array([89, 255, 255]) #85, 255, 255
 black_min     = np.array([0, 0, 0])
-black_max_top = np.array([90, 90, 90])
-black_max_bot = np.array([135, 135, 135])
-MIN_GREEN_AREA = 2500
-LIMIAR_PIXELS_VERDE_OUTRO_LADO = 2000  # verde do lado oposto acima disso = pode ser o 2o marcador do 180 comecando a aparecer
+black_max_top = np.array([78, 78, 78]) #90, 90, 90
+black_max_bot = np.array([91, 91, 91]) #135, 135, 135
+MIN_GREEN_AREA = 1000 #2500
+LIMIAR_PIXELS_VERDE_OUTRO_LADO = 1500  # verde do lado oposto acima disso = pode ser o 2o marcador do 180 comecando a aparecer
 
 DEBUG_VERDE = True
 DEBUG_SEM_ACAO = False
@@ -292,10 +344,10 @@ def check_green(contours_grn, black_image, green_image):
     pixels_verde = cv2.countNonZero(green_image)
     print("pixel verde", pixels_verde)
 
-    contador_180 = contador_180 + 1 if turn_180 else 0
+    #contador_180 = contador_180 + 1 if turn_180 else 0
     contador_esquerda = contador_esquerda + 1 if turn_left else 0
     contador_direita = contador_direita + 1 if turn_right else 0
-
+    turn_left, turn_right, turn_180 = determine_turn_direction(black_around_sign, green_centers)
     if turn_180:
         return "GIRAR_180"
     elif turn_left and pixels_verde < 15500 and contador_esquerda > 2 and contador_direita < 1:
@@ -385,36 +437,18 @@ def verde(roi):
     if not acao_verde:
         return
 
-    if DEBUG_SEM_ACAO:
-        print(f"[DEBUG SEM ACAO] Verde detectado: {acao_verde} "
-              f"| esq={contador_esquerda} dir={contador_direita} 180={contador_180}")
-        return
-
-    print(f"[VERDE] Primeira deteccao: {acao_verde}")
-    inicio_confirmacao = time.time()
-    acao_confirmada = acao_verde
-
-    while time.time() - inicio_confirmacao < 0.01:
-        config.checar_parada()
-        ret, frame_conf = config.cap.read()
-        if not ret:
-            continue
-        cx_c, contours_c, roi_c, _ = visao(frame_conf)
-        controle(cx_c, contours_c, roi_c)
-        nova_acao = detectar_verde(roi_c)
-        if nova_acao:
-            acao_confirmada = nova_acao
-
-    acao_verde = acao_confirmada
+   
+    
     config.parar()
 
     if acao_verde == "ESQUERDA":
+        print("verde_esquerda")
         config.mover(-2, -2)
         time.sleep(0.9)
         config.mover(15, 15)
         time.sleep(0.25)
         config.parar()
-        movimentos_bases.guinada2('E', 92, 20)
+        movimentos_bases.guinada2('E', 88, 20)
         config.mover(15, 15)
         time.sleep(0.2)
         inicio = time.time()
@@ -427,13 +461,14 @@ def verde(roi):
             controle(cx, contours, roi_loop)
 
     elif acao_verde == "DIREITA":
+        print("verde_direita")
         limpar_camera(10)
         config.mover(-2, -2)
         time.sleep(0.9)
         config.mover(15, 15)
         time.sleep(0.25)
         config.parar()
-        movimentos_bases.guinada2('D', 92, 20)
+        movimentos_bases.guinada2('D', 88, 20)
         config.mover(15, 15)
         time.sleep(0.2)
         inicio = time.time()

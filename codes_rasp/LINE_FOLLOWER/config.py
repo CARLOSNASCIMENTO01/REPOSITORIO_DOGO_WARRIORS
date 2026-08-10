@@ -1,6 +1,6 @@
 """
 Hardware do seguidor de linha: estado de execucao/parada, GPIO, motores
-(placa Yahboom), servos, botao, giroscopio (MPU6050), sonar (serial do
+(placa Yahboom), servos, botao, giroscopio (BNO055), sonar (serial do
 Arduino) e camera de linha. Tudo que os outros modulos (movimentos_bases,
 seguimento_de_linha, obstaculos_trajeto, resgate_de_vitimas) importam pra
 poder mexer no robo de verdade.
@@ -84,13 +84,12 @@ lgpio.gpio_claim_input(h, TCRT)
 #   M3 = traseira direita               | M4 = dianteira esquerda
 # Todo canal usa sinal invertido nesse robo (motor montado espelhado no
 # chassi) - por isso o -1 em cada valor antes de mandar.
-YAHBOOM_PORTA = "/dev/serial/by-path/platform-xhci-hcd.0-usb-0:1:1.0-port0"
 YAHBOOM_BAUDRATE = 115200
 ESCALA_PWM_YAHBOOM = 70  # converte a faixa antiga do L298N (-50..50) pra PWM Yahboom (-3600..3600)
 PWM_FREIO_YAHBOOM = 700   # forca do pulso de freio reverso ao parar
 TEMPO_FREIO_YAHBOOM = 0.08  # segundos do pulso de freio
 
-VEL_MAX = 20 #45
+VEL_MAX = 20 #20
 VEL_MIN = -VEL_MAX
 
 ANGULO_INICIAL = 90
@@ -98,9 +97,62 @@ ANGULO_INICIAL = 90
 # Servo pesado como indicador visual de ligado/desligado: levantado (150)
 # enquanto o robo esta ativo, abaixado (0) enquanto parado/esperando o botao.
 SERVO_PESADO_ANGULO_ATIVO = 140
-SERVO_PESADO_ANGULO_PARADO = 10
+SERVO_PESADO_ANGULO_PARADO = 90
 
-motor_serial = serial.Serial(YAHBOOM_PORTA, YAHBOOM_BAUDRATE, timeout=0.5)
+def _detectar_porta_yahboom(sair_se_falhar=True):
+    """Acha a porta serial da placa Yahboom pelo VID:PID (1a86:7522, CH340
+    generico), nao por um caminho fisico fixo - assim funciona em
+    qualquer porta USB, nao so a que foi usada quando o caminho foi
+    medido. Mesmo padrao usado pra achar o Arduino mais abaixo
+    (detectar_porta/aguardar_porta).
+
+    De proposito SEM atalho por caminho fixo (by-path): esse caminho e
+    atrelado ao SLOT fisico da porta USB, nao ao dispositivo - se a placa
+    for trocada de porta, um by-path antigo passaria a apontar pra outro
+    dispositivo qualquer (ex: o Arduino), que abre serial sem erro nenhum
+    mas nao e a Yahboom do outro lado. O sintoma seria o robo "conectar"
+    normal e os motores simplesmente nao se mexerem, sem nenhum erro no
+    log - so o VID:PID garante que e o dispositivo certo."""
+    for p in serial.tools.list_ports.comports():
+        if (p.vid, p.pid) == (0x1a86, 0x7522):
+            try:
+                s = serial.Serial(p.device, YAHBOOM_BAUDRATE, timeout=0.5)
+                print(f"[MOTOR] Placa Yahboom encontrada em: {p.device}")
+                return s
+            except serial.SerialException:
+                continue
+
+    if sair_se_falhar:
+        print("[MOTOR][ERRO] Placa Yahboom nao encontrada!")
+        sys.exit(1)
+    return None
+
+
+def _aguardar_porta_yahboom(intervalo=1.0):
+    """Espera a placa Yahboom aparecer em vez de derrubar o processo
+    inteiro se ela nao estiver ligada/conectada nesse instante do boot -
+    antes, um serial.Serial() direto aqui crashava o servico inteiro e o
+    systemd ficava reiniciando em loop toda vez que a placa nao estava
+    plugada bem na hora do boot."""
+    porta = _detectar_porta_yahboom(sair_se_falhar=False)
+    tentativas = 0
+    while porta is None:
+        tentativas += 1
+        print(f"[MOTOR] Placa Yahboom ainda nao apareceu, tentando de novo... ({tentativas})")
+        time.sleep(intervalo)
+        porta = _detectar_porta_yahboom(sair_se_falhar=False)
+    # O dispositivo USB aparece na hora, mas o CH340/firmware da placa
+    # costuma resetar quando a serial e reaberta - sem essa espera, os
+    # primeiros comandos $pwm: saem enquanto ela ainda esta subindo e sao
+    # ignorados (sem erro nenhum, so nao mexe). Mesmo padrao usado no
+    # handshake_serial() do Arduino (ver mais abaixo).
+    print("[MOTOR] Placa Yahboom encontrada, esperando ela terminar de subir...")
+    time.sleep(2.0)
+    print("[MOTOR] Pronta")
+    return porta
+
+
+motor_serial = _aguardar_porta_yahboom()
 
 
 def _enviar_pwm_yahboom(m1, m2, m3, m4):
@@ -222,13 +274,63 @@ def sensor_e():
     return lgpio.gpio_read(h, TCRT)
 
 
+def reiniciar_processo():
+    """Reinicia o processo do zero via os.execv - equivalente a apertar
+    Ctrl+C no terminal e rodar `python3 main.py` de novo. Um resume "por
+    dentro" (so robo_ativo.set()) carrega estado velho de threads/sensores
+    (referencia de travamento, offset do giro, buffer da camera, etc.);
+    reiniciar o processo garante que tudo comeca limpo, sem herdar nada
+    disso. Igual ao resto do codigo que usa execv (main.py <-> resgate.py),
+    limpa motor/camera/GPIO antes de trocar a imagem do processo."""
+    print("[BOTAO] Reiniciando processo do zero...")
+    try:
+        parar()
+    except Exception as e:
+        print(f"[BOTAO][ERRO] Falha ao parar motores antes de reiniciar: {e}")
+    try:
+        mover_servo_direto(PINO_PESADO, SERVO_PESADO_ANGULO_PARADO)
+    except Exception as e:
+        print(f"[BOTAO][ERRO] Falha ao abaixar servo antes de reiniciar: {e}")
+    try:
+        if cap is not None:
+            cap.release()
+    except Exception as e:
+        print(f"[BOTAO][ERRO] Falha ao liberar camera antes de reiniciar: {e}")
+    try:
+        if ser is not None:
+            ser.close()
+    except Exception as e:
+        print(f"[BOTAO][ERRO] Falha ao fechar serial do sonar antes de reiniciar: {e}")
+    try:
+        if motor_serial is not None:
+            motor_serial.close()
+    except Exception as e:
+        print(f"[BOTAO][ERRO] Falha ao fechar serial do motor antes de reiniciar: {e}")
+    try:
+        lgpio.gpiochip_close(h)
+    except Exception as e:
+        print(f"[BOTAO][ERRO] Falha ao fechar GPIO antes de reiniciar: {e}")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 def botao_thread():
     anterior = 0
+    # --auto ja comeca com robo_ativo ligado (vindo do resgate) - nesse caso
+    # a "primeira ativacao" ja aconteceu antes dessa thread nem existir.
+    ja_foi_ativado = robo_ativo.is_set()
     while True:
         estado = lgpio.gpio_read(h, BUTTON)
         if estado == 1 and anterior == 0:
             time.sleep(0.03)
             if lgpio.gpio_read(h, BUTTON) == 1:
+                # Espera soltar ANTES de agir. reiniciar_processo() faz
+                # execv e nao volta mais pra essa thread - se agisse com o
+                # dedo ainda no botao, o processo novo nasceria com
+                # anterior=0 e leria esse MESMO nivel alto como um toque
+                # novo, reiniciando em loop enquanto o botao nao fosse
+                # solto de verdade. Por isso o release tem que vir antes.
+                while lgpio.gpio_read(h, BUTTON) == 1:
+                    time.sleep(0.02)
                 if robo_ativo.is_set():
                     robo_ativo.clear()
                     parar()
@@ -240,28 +342,53 @@ def botao_thread():
                         mover_servo_direto(PINO_PESADO, SERVO_PESADO_ANGULO_PARADO)
                     except Exception as e:
                         print(f"[BOTAO][ERRO] Falha ao abaixar servo pesado: {e}")
-                else:
-                    print("[BOTAO] REINICIANDO...")
+                elif not ja_foi_ativado:
+                    # Primeira ativacao desse processo (boot fresco, nunca
+                    # rodou ainda) - so liga normal, sem reiniciar. Reiniciar
+                    # aqui nao teria nenhum estado velho pra limpar e so
+                    # ficava reiniciando em loop sem nunca chegar a andar.
+                    print("[BOTAO] INICIANDO...")
+                    ja_foi_ativado = True
                     robo_ativo.set()
                     try:
                         mover_servo_direto(PINO_PESADO, SERVO_PESADO_ANGULO_ATIVO)
                     except Exception as e:
                         print(f"[BOTAO][ERRO] Falha ao levantar servo pesado: {e}")
-                while lgpio.gpio_read(h, BUTTON) == 1:
-                    time.sleep(0.02)
+                else:
+                    # Ja tinha rodado antes e foi parado - agora sim reinicia
+                    # o processo inteiro do zero, igual parar no terminal e
+                    # rodar de novo. Ver reiniciar_processo().
+                    reiniciar_processo()
         anterior = estado
         time.sleep(0.02)
 
 
 # =========================================================================
-# MPU6050 DIRETO NA RASP
+# BNO055 DIRETO NA RASP (modo IMUPLUS: fusao interna de acel+giro, SEM
+# magnetometro). O modo de fusao NDOF usa o magnetometro pra achar o norte -
+# perto dos motores/ponte H a interferencia magnetica fazia o heading
+# "pular"/resetar sozinho quando o robo mexia, entao o magnetometro continua
+# fora. Mas o eixo Z (heading/yaw, usado pelas guinadas) agora vem PRONTO da
+# fusao interna do chip em vez de integrar o giro cru em software - o chip
+# faz compensacao de deriva/temperatura melhor do que a integracao manual.
+# X e Y continuam exatamente como antes (giro cru integrado em software e
+# acelerometro cru, respectivamente) - nada mudou neles.
 # =========================================================================
 _gyro_lock = threading.Lock()
-MPU_ADDR    = 0x68
-GYRO_XOUT_H = 0x43
-ACCEL_XOUT_H = 0x3B
-ACCEL_YOUT_H = 0x3D
-ACCEL_ZOUT_H = 0x3F
+BNO_ADDR        = 0x29  # 0x28 se o pino ADR do modulo estiver em GND
+REG_CHIP_ID     = 0x00
+REG_OPR_MODE    = 0x3D
+REG_PWR_MODE    = 0x3E
+REG_SYS_TRIGGER = 0x3F
+REG_UNIT_SEL    = 0x3B
+GYR_DATA_X      = 0x14  # giroscopio cru (x,y,z) - 16 LSB = 1 grau/s
+ACC_DATA_X      = 0x08  # acelerometro cru (x,y,z)
+EUL_DATA_HEADING = 0x1A  # heading (yaw) ja calculado pela fusao - 16 LSB = 1 grau
+MODO_CONFIG     = 0x00
+MODO_ACCGYRO    = 0x05  # acel + giro crus, sem magnetometro e sem fusao interna (nao usado mais - so referencia)
+MODO_IMUPLUS    = 0x08  # fusao 6DOF (acel+giro) sem magnetometro - da heading/roll/pitch prontos
+CHIP_ID_ESPERADO = 0xA0
+LIMITE_DPS_PLAUSIVEL = 2000.0  # fundo de escala do giroscopio - acima disso e leitura corrompida
 bus = smbus2.SMBus(1)
 
 ang_gyro          = {"X": 0.0, "Y": 0.0, "Z": 0.0}
@@ -269,17 +396,23 @@ gyro_offset       = {"X": 0.0, "Y": 0.0, "Z": 0.0}
 gyro_ultimo_tempo = time.time()
 
 _angulo_y_filtrado = None
+_heading_offset = 0.0  # heading (fusao) no momento do ultimo resetar_giroscopio() - vira o "zero" da guinada
+_ultimo_angulo_z = [0]  # cache do ultimo angulo_z() valido, pra nao quebrar guinada numa falha I2C isolada
 
 
-def _mpu_write(reg, val):
-    bus.write_byte_data(MPU_ADDR, reg, val)
+def _bno_write(reg, val):
+    bus.write_byte_data(BNO_ADDR, reg, val)
 
 
-def _mpu_read_word(reg, tentativas=3):
+def _bno_read_word(reg, tentativas=3):
     for tentativa in range(tentativas):
         try:
-            hi = bus.read_byte_data(MPU_ADDR, reg)
-            lo = bus.read_byte_data(MPU_ADDR, reg + 1)
+            # BNO055 guarda LSB no endereco base e MSB no endereco+1 (ordem
+            # OPOSTA do MPU6050, que guarda MSB primeiro) - inverter isso
+            # aqui e o que fazia o giroscopio ler lixo (byte trocado) e o
+            # angulo Z "explodir" pra qualquer valor entre -180 e 180.
+            lo = bus.read_byte_data(BNO_ADDR, reg)
+            hi = bus.read_byte_data(BNO_ADDR, reg + 1)
 
             valor = (hi << 8) | lo
 
@@ -301,12 +434,19 @@ def _normalizar(ang):
     return ang
 
 
+def _ler_heading_bruto():
+    """Heading (yaw) 0-360 graus ja calculado pela fusao interna do chip -
+    substitui a integracao manual do giro cru pra esse eixo."""
+    with _gyro_lock:
+        return _bno_read_word(EUL_DATA_HEADING) / 16.0
+
+
 def _calibrar(amostras=200):
     gx = gy = gz = 0
     for _ in range(amostras):
-        gx += _mpu_read_word(GYRO_XOUT_H)
-        gy += _mpu_read_word(GYRO_XOUT_H + 2)
-        gz += _mpu_read_word(GYRO_XOUT_H + 4)
+        gx += _bno_read_word(GYR_DATA_X)
+        gy += _bno_read_word(GYR_DATA_X + 2)
+        gz += _bno_read_word(GYR_DATA_X + 4)
         time.sleep(0.005)
     gyro_offset["X"] = gx / amostras
     gyro_offset["Y"] = gy / amostras
@@ -314,15 +454,29 @@ def _calibrar(amostras=200):
 
 
 def resetar_giroscopio():
-    global ang_gyro, gyro_ultimo_tempo
+    global ang_gyro, gyro_ultimo_tempo, _heading_offset
     with _gyro_lock:
         ang_gyro = {"X": 0.0, "Y": 0.0, "Z": 0.0}
         gyro_ultimo_tempo = time.time()
+    try:
+        _heading_offset = _ler_heading_bruto()
+    except Exception as e:
+        print(f"[BNO055] Falha ao ler heading pro reset ({e}), mantendo offset anterior.")
 
 
 def angulo_x(): return int(ang_gyro["X"])
 def angulo_y(): return angulo_y_estavel()
-def angulo_z(): return int(ang_gyro["Z"])
+
+
+def angulo_z():
+    """Yaw relativo ao ultimo resetar_giroscopio(), vindo do heading ja
+    calculado pela fusao do chip (nao mais integracao de giro cru)."""
+    try:
+        atual = _ler_heading_bruto()
+        _ultimo_angulo_z[0] = int(_normalizar(atual - _heading_offset))
+    except Exception as e:
+        print(f"[BNO055] Falha ao ler heading calculado ({e}), mantendo ultimo valor.")
+    return _ultimo_angulo_z[0]
 
 
 def _gyro_thread():
@@ -336,31 +490,67 @@ def _gyro_thread():
             if dt > 0.5:
                 time.sleep(0.005)
                 continue
-            gx = (_mpu_read_word(GYRO_XOUT_H)     - gyro_offset["X"]) / 131.0
-            gy = (_mpu_read_word(GYRO_XOUT_H + 2) - gyro_offset["Y"]) / 131.0
-            gz = (_mpu_read_word(GYRO_XOUT_H + 4) - gyro_offset["Z"]) / 131.0
+            # Lock tambem durante a leitura crua (nao so na atualizacao do
+            # dict) - agora angulo_z() faz leitura I2C do heading fundido a
+            # partir da thread principal (guinada), concorrente com essa
+            # thread. Sem o lock aqui, as duas podiam intercalar leituras
+            # multi-byte no mesmo barramento e corromper o valor lido.
+            with _gyro_lock:
+                gx = (_bno_read_word(GYR_DATA_X)     - gyro_offset["X"]) / 16.0
+                gy = (_bno_read_word(GYR_DATA_X + 2) - gyro_offset["Y"]) / 16.0
+                gz = (_bno_read_word(GYR_DATA_X + 4) - gyro_offset["Z"]) / 16.0
+            # Fundo de escala do giroscopio e 2000 dps - qualquer valor acima
+            # disso e fisicamente impossivel, e leitura corrompida (ruido
+            # eletrico dos motores no barramento I2C, mais comum durante
+            # guinada/desvio com motor puxando corrente). Integrar isso
+            # jogava o angulo acumulado centenas de graus com 1 amostra so.
+            if max(abs(gx), abs(gy), abs(gz)) > LIMITE_DPS_PLAUSIVEL:
+                print(f"[BNO055] Amostra de giro implausivel descartada (X={gx:.0f} Y={gy:.0f} Z={gz:.0f} dps)")
+                time.sleep(0.005)
+                continue
             with _gyro_lock:
                 ang_gyro["X"] = _normalizar(ang_gyro["X"] + gx * dt)
                 ang_gyro["Y"] = _normalizar(ang_gyro["Y"] + gy * dt)
                 ang_gyro["Z"] = _normalizar(ang_gyro["Z"] + gz * dt)
+            # BNO055 so produz amostra nova de giro a ~100Hz (a cada 10ms) -
+            # sem essa pausa a thread ficava martelando o I2C em loop fechado
+            # o tempo todo (parado ou andando, nao tem como desligar), so
+            # relendo a MESMA amostra varias vezes, ocupando um nucleo
+            # inteiro a toa e disputando I2C/CPU com o resto do sistema.
+            time.sleep(0.005)
         except OSError as e:
-            print(f"[MPU] Gyro I2C: {e}")
+            print(f"[BNO055] Gyro I2C: {e}")
             time.sleep(0.005)
 
         except Exception as e:
-            print(f"[MPU] Gyro: {e}")
+            print(f"[BNO055] Gyro: {e}")
             time.sleep(0.005)
 
 
 def iniciar_mpu():
-    _mpu_write(0x6B, 0x00)
-    time.sleep(0.05)
-    _mpu_write(0x1B, 0x00)
-    time.sleep(0.05)
-    print("[MPU6050] Calibrando...")
+    """Nome mantido por compatibilidade com quem ja importa/chama
+    config.iniciar_mpu (main.py) - por dentro agora inicializa o BNO055."""
+    _bno_write(REG_OPR_MODE, MODO_CONFIG)
+    time.sleep(0.02)
+    _bno_write(REG_SYS_TRIGGER, 0x20)  # reset
+    time.sleep(0.65)
+    for _ in range(20):  # espera o chip voltar a responder apos o reset
+        try:
+            if bus.read_byte_data(BNO_ADDR, REG_CHIP_ID) == CHIP_ID_ESPERADO:
+                break
+        except OSError:
+            pass
+        time.sleep(0.05)
+    _bno_write(REG_PWR_MODE, 0x00)  # normal
+    time.sleep(0.02)
+    _bno_write(REG_UNIT_SEL, 0x00)  # graus, graus/s, m/s^2
+    time.sleep(0.02)
+    _bno_write(REG_OPR_MODE, MODO_IMUPLUS)
+    time.sleep(0.03)
+    print("[BNO055] Calibrando...")
     _calibrar()
     resetar_giroscopio()
-    print("[MPU6050] Pronto")
+    print("[BNO055] Pronto")
     Thread(target=_gyro_thread, daemon=True).start()
 
 
@@ -372,9 +562,11 @@ def angulo_y_estavel(alpha=0.97):
     global _angulo_y_filtrado
 
     try:
-        ax = _mpu_read_word(ACCEL_XOUT_H) / 16384.0
-        ay = _mpu_read_word(ACCEL_YOUT_H) / 16384.0
-        az = _mpu_read_word(ACCEL_ZOUT_H) / 16384.0
+        # Sem normalizar pela escala (100 LSB = 1 m/s^2 no BNO055) porque
+        # atan2 usa so a RAZAO entre os eixos - o fator de escala cancela.
+        ax = _bno_read_word(ACC_DATA_X)
+        ay = _bno_read_word(ACC_DATA_X + 2)
+        az = _bno_read_word(ACC_DATA_X + 4)
 
         angulo = math.degrees(
             math.atan2(-ax, math.sqrt(ay * ay + az * az))
@@ -389,7 +581,7 @@ def angulo_y_estavel(alpha=0.97):
             )
 
     except OSError as e:
-        print(f"[MPU] Falha I2C ({e}), mantendo último valor.")
+        print(f"[BNO055] Falha I2C ({e}), mantendo último valor.")
         # NÃO derruba o programa
 
     if _angulo_y_filtrado is None:
@@ -420,8 +612,18 @@ def detectar_porta(sair_se_falhar=True):
 
     PALAVRAS_FTDI = ["ftdi", "ft232", "usb serial converter", "ftb6spl3"]
     portas = serial.tools.list_ports.comports()
+    # A porta da placa Yahboom ja foi achada por VID:PID (ver
+    # _detectar_porta_yahboom) - nunca pode ser tambem a porta do Arduino,
+    # senao os dois ficam abrindo o MESMO device concorrentemente (visto ao
+    # vivo: PWM do motor falhando com I/O error e o sonar nunca recebendo
+    # dado valido, preso reconectando). So acontece quando o caminho fixo e
+    # a busca por palavra-chave FTDI abaixo falham e cai no fallback
+    # generico - mas vale excluir nos dois pra garantir.
+    porta_motor = motor_serial.port if motor_serial is not None else None
 
     for p in portas:
+        if p.device == porta_motor:
+            continue
         desc = f"{p.description} {p.manufacturer or ''} {p.hwid or ''}".lower()
         if any(palavra in desc for palavra in PALAVRAS_FTDI):
             try:
@@ -432,6 +634,8 @@ def detectar_porta(sair_se_falhar=True):
                 continue
 
     for p in portas:
+        if p.device == porta_motor:
+            continue
         if "ttyUSB" in p.device or "ttyACM" in p.device:
             try:
                 s = serial.Serial(p.device, 115200, timeout=0.04)

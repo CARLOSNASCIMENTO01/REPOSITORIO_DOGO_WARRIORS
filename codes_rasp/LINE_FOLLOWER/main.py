@@ -5,7 +5,7 @@ funcoes importadas dos modulos por assunto). A logica de cada assunto mora
 no modulo dele:
 
   config.py              - hardware: estado/parada, GPIO, motores Yahboom,
-                            servos, botao, giroscopio (MPU6050), sonar
+                            servos, botao, giroscopio (BNO055), sonar
                             (serial do Arduino) e camera de linha (cap)
   movimentos_bases.py    - guinada2 / guinada_pid
   seguimento_de_linha.py - visao(), controle() (PID), deteccao de verde
@@ -19,7 +19,7 @@ Mudancas de comportamento pedidas (nao sao bugfix, sao features novas):
      loop principal do zero.
   2) Parada imediata em qualquer ponto do codigo via excecao RoboParado,
      checada a cada iteracao dos while True internos.
-  3) Boot mais rapido: camera, serial e calibracao do MPU rodam em paralelo.
+  3) Boot mais rapido: camera, serial e calibracao do BNO055 rodam em paralelo.
   4) Se a porta serial nao aparecer na hora do boot (arduino ainda enumerando
      na USB), fica tentando em vez de matar o processo.
   5) Erros inesperados no loop principal nao derrubam o programa: sao
@@ -124,6 +124,11 @@ def loop_principal():
                 if not ret:
                     continue
                 cx, contours, roi, mask = seguimento_de_linha.visao(frame)
+                # Sem isso, um marcador verde que tambem derruba o contorno
+                # preto principal (gap_debug=True) ficava sem nenhuma chance
+                # de ser detectado/reagido enquanto esse loop conta o tempo
+                # de gap - o verde() precisa continuar rodando junto.
+                verde(roi)
                 if not seguimento_de_linha.gap_debug(contours):
                     print("[GAP] Saiu do gap, voltando a linha")
                     break
@@ -142,24 +147,6 @@ def loop_principal():
 # =========================================================================
 # BOOT
 # =========================================================================
-config.robo_ativo.set()
-config.angulo(150)
-config.angulo(0)
-if "--auto" in sys.argv:
-    # ja comeca ativo (vindo do resgate) - servo pesado levantado.
-    # mover_servo_direto() aqui de proposito, nao mover_servo(): logo no
-    # boot o codigo nao faz ideia de onde o servo pesado fisicamente esta
-    # (fica onde foi deixado na execucao anterior), mas mover_servo() monta
-    # uma rampa suave assumindo que ele comeca em ANGULO_INICIAL=90 - se a
-    # posicao real for outra (o normal), o servo da um salto/correcao logo
-    # no inicio da rampa em vez de simplesmente ir direto pro alvo.
-    config.mover_servo_direto(config.PINO_PESADO, config.SERVO_PESADO_ANGULO_ATIVO)
-else:
-    # esperando o botao pra comecar - servo pesado abaixado, indicando parado
-    config.mover_servo_direto(config.PINO_PESADO, config.SERVO_PESADO_ANGULO_PARADO)
-    config.robo_ativo.clear()
-
-
 def iniciar_hardware():
     t_mpu = Thread(target=config.iniciar_mpu)
     t_mpu.start()
@@ -184,6 +171,27 @@ if __name__ == "__main__":
     t0 = time.time()
     iniciar_hardware()
     print(f"[BOOT] Tempo de inicializacao: {time.time() - t0:.1f}s")
+
+    # Servos so se mexem AQUI, depois do giroscopio calibrado (dentro de
+    # iniciar_hardware() -> t_mpu.join()) - se mexessem antes, a propria
+    # vibracao do servo durante a calibracao (_calibrar() em config.py)
+    # podia jogar o offset de "parado" pra um valor errado.
+    config.robo_ativo.set()
+    config.angulo(150)
+    config.angulo(0)
+    if "--auto" in sys.argv:
+        # ja comeca ativo (vindo do resgate) - servo pesado levantado.
+        # mover_servo_direto() aqui de proposito, nao mover_servo(): logo no
+        # boot o codigo nao faz ideia de onde o servo pesado fisicamente esta
+        # (fica onde foi deixado na execucao anterior), mas mover_servo() monta
+        # uma rampa suave assumindo que ele comeca em ANGULO_INICIAL=90 - se a
+        # posicao real for outra (o normal), o servo da um salto/correcao logo
+        # no inicio da rampa em vez de simplesmente ir direto pro alvo.
+        config.mover_servo_direto(config.PINO_PESADO, config.SERVO_PESADO_ANGULO_ATIVO)
+    else:
+        # esperando o botao pra comecar - servo pesado abaixado, indicando parado
+        config.mover_servo_direto(config.PINO_PESADO, config.SERVO_PESADO_ANGULO_PARADO)
+        config.robo_ativo.clear()
 
     Thread(target=config.botao_thread, daemon=True).start()
 

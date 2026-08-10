@@ -14,25 +14,30 @@ import config
 def guinada2(LADO, GRAUS, VELOCIDADE):
     config.resetar_giroscopio()
     time.sleep(0.1)
-    Graus = abs(GRAUS - 13)
-    if LADO == 'D':
+    Graus = abs(GRAUS)
+    if LADO == 'E':
         while True:
             config.checar_parada()
-            config.mover(VELOCIDADE, -VELOCIDADE)
+            config.mover(-VELOCIDADE, VELOCIDADE)
             if config.angulo_z() <= -Graus:
-                config.mover(-10, 10)
+                config.mover(2, -2)
                 time.sleep(0.09)
                 break
             time.sleep(0.005)
     else:
         while True:
             config.checar_parada()
-            config.mover(-VELOCIDADE, VELOCIDADE)
+            config.mover(VELOCIDADE, -VELOCIDADE)
             if config.angulo_z() >= Graus:
-                config.mover(10, -10)
+                config.mover(-2, 2)
                 time.sleep(0.09)
                 break
             time.sleep(0.005)
+    # Zera de novo ao terminar - sem isso o angulo_z() ficava preso no valor
+    # da guinada (ex: 90) durante todo o segmento reto seguinte, ate a
+    # PROXIMA guinada zerar - confundia debug e deixava lixo acumulado
+    # exposto pra qualquer outro codigo que va ler angulo_z() nesse meio tempo.
+    config.resetar_giroscopio()
 
 
 def guinada_pid(LADO, GRAUS, VEL_MAX_GIRO=100, VEL_MIN_GIRO=29, ZONA_CHEGADA=10):
@@ -60,6 +65,7 @@ def guinada_pid(LADO, GRAUS, VEL_MAX_GIRO=100, VEL_MIN_GIRO=29, ZONA_CHEGADA=10)
                 config.mover(15, -15)
             time.sleep(0.09)
             config.parar()
+            config.resetar_giroscopio()
             break
 
         integral += erro * dt

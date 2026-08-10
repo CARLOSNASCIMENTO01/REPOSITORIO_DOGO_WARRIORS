@@ -71,15 +71,15 @@ def checar_parada():
 # =========================================================================
 # CONFIG (NAO ALTERADO)
 # =========================================================================
-Kp = 1.4 #1.6, 1,9
-Kd = 0.3 # 0.7, 0.5, 0.9
-VEL_BASE = 16 #20, 25
-VEL_MAX  = 20 #45
+Kp = 0.3 #1.6, 1,9
+Kd = 0.2 # 0.7, 22.5, 0.9
+VEL_BASE = 18 #20, 25
+VEL_MAX  = 25 #45
 VEL_MIN  = -VEL_MAX
 VEL_GAP  = 25
 TEMPO_GAP_SALA_RESGATE = 3.0  # segundos em gap continuo pra considerar sala de resgate
 LIMIAR   = 80
-DEADZONE =5 # 8, 0
+DEADZONE = 6 # 8, 0
 AREA_MIN = 11000
 TCRT = 6  # GPIO BCM 5
 # IN1/IN2/ENA/IN3/IN4/ENB (L298N via GPIO) removidos - motores agora vao
@@ -1251,76 +1251,84 @@ def desvio():
     # saber que nao esta na gangorra).
     if not (-5 < angulo_y() < 3):
         return
-    if distancia_frente() <= 6:
+    if distancia_frente() <= 5:
         # O Arduino alterna F/E a cada 60ms, entao cada sonar so atualiza a
         # cada ~120ms. Um sleep menor que isso reconfere o MESMO valor em
         # cache, nao uma leitura nova - por isso 0.15s aqui, nao 0.09s.
-        time.sleep(0.15)
+        mover(-2,-2)
+        time.sleep(0.09)
+        mover(-2,-2)
+        time.sleep(0.1)
         if distancia_frente() <= 5:
-            mover(30, 30)
-            mover(-30, -30)
+            mover(18, 18)
+            mover(-18, -18)
             time.sleep(0.2)
-            mover(-10, -10)
+            mover(-2, -2)
             time.sleep(0.1)
 
-            guinada_pid("D", 90)
+            guinada2("D", 100,18)
+            time.sleep(0.2)
 
             while True:
                 checar_parada()
-                mover(30, 30)
+                mover(18, 18)
                 if distancia_esquerda() < 15:
-                    mover(-10, -10)
-                    time.sleep(0.2)
+                    mover(-2, -2)
+                    time.sleep(0.8)
                     break
                 time.sleep(0.005)
 
             while True:
                 checar_parada()
-                mover(35, 35)
+                mover(18, 18)
                 if distancia_esquerda() > 20:
-                    mover(-10, -10)
+                    mover(-2, -2)
                     time.sleep(0.2)
                     break
                 time.sleep(0.005)
-
-            guinada_pid("E", 90)
+            time.sleep(0.2)
+            guinada2("E", 90,18)
             while True:
                 checar_parada()
-                mover(30, 30)
+                mover(18, 18)
                 if distancia_esquerda() < 20:
-                    mover(30, 30)
+                    mover(15, 15)
                     time.sleep(0.2)
-                    mover(-10, -10)
+                    mover(-2, -2)
                     time.sleep(0.3)
                     break
                 time.sleep(0.005)
 
             while True:
                 checar_parada()
-                mover(30, 30)
+                mover(18, 18)
                 if distancia_esquerda() > 17:
-                    mover(40, 40)
-                    time.sleep(0.4)
-                    mover(-10, -10)
+                    mover(20, 20)
+                    time.sleep(0.5)
+                    mover(-2, -2)
                     time.sleep(0.3)
                     break
                 time.sleep(0.005)
 
-            guinada_pid("E", 84)
+            guinada2("E", 94,18)
             while True:
                 checar_parada()
-                mover(30, 30)
-                if distancia_esquerda() < 20:
-                    mover(-40, -40)
-                    time.sleep(0.3)
-                    mover(10, 10)
-                    time.sleep(0.3)
+                mover(18, 18)
+                if sensor_e() == 1:
+                    print("enchi minh calça d merda ")
+                    
+                    mover(-2, -2)
+                    time.sleep(0.9)
                     break
                 time.sleep(0.005)
 
-            guinada_pid("D", 90)
-            mover(-30, -30)
-            time.sleep(0.4)
+            guinada2("D", 90,18)
+            mover(-18, -18)
+            time.sleep(0.3)
+            mover(2,2)
+            time.sleep(0.9)
+            mover(0,0)
+            time.sleep(0.8)
 
 
 def verde(roi):
@@ -1354,12 +1362,14 @@ def verde(roi):
   
 
     if acao_verde == "ESQUERDA":
-        mover(-10, -10)
+        mover(-2, -2)
         time.sleep(0.1)
-        mover(30, 30)
-        time.sleep(0.18)
+        mover(15, 15)
+        time.sleep(0.25)
         parar()
-        guinada2('E', 85, 35)
+        guinada2('E', 92, 20)
+        mover(15,15)
+        time.sleep(0.2)
         inicio = time.time()
         while time.time() - inicio < 1.0:
             checar_parada()
@@ -1371,12 +1381,14 @@ def verde(roi):
 
     elif acao_verde == "DIREITA":
         limpar_camera(10)
-        mover(-10, -10)
+        mover(-2, -2)
         time.sleep(0.1)
-        mover(30, 30)
-        time.sleep(0.18)
+        mover(15, 15)
+        time.sleep(0.25)
         parar()
-        guinada2('D', 85, 35)
+        guinada2('D', 92, 20)
+        mover(15,15)
+        time.sleep(0.2)
         inicio = time.time()
         while time.time() - inicio < 1.0:
             checar_parada()
@@ -1388,12 +1400,12 @@ def verde(roi):
 
     elif acao_verde == "GIRAR_180":
         print("gira 180")
-        mover(-12, -12)
+        mover(-2, -2)
         time.sleep(0.09)
-        guinada_pid("D", 160)
-        mover(30, 30)
-        time.sleep(0.19)
-        mover(-10, -10)
+        guinada2("D",170,20)
+        mover(15, 15)
+        time.sleep(0.22)
+        mover(-2, -2)
         time.sleep(0.2)
         parar()
         limpar_camera(10)
@@ -1519,9 +1531,9 @@ def controle(cx, contours, roi):
     
     if angulo_y() <= -16:
         contador_gangorra = 2
-        velocidade_base = 45
-        velL = np.clip(velocidade_base + ajuste, 20, 100)
-        velR = np.clip(velocidade_base - ajuste, 20, 100)
+        velocidade_base = 20
+        velL = np.clip(velocidade_base + ajuste, VEL_MIN, VEL_MAX)
+        velR = np.clip(velocidade_base - ajuste, VEL_MIN, VEL_MAX)
     else:
         velocidade_base = VEL_BASE
         velL = np.clip(velocidade_base + ajuste, VEL_MIN, VEL_MAX)
@@ -1538,6 +1550,8 @@ def controle(cx, contours, roi):
         velocidade_base = 20
         velL = velocidade_base + ajuste
         velR = velocidade_base - ajuste
+
+   
     mover(velL, velR)
     ultimo_erro = erro
 

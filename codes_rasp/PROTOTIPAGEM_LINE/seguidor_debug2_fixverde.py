@@ -71,20 +71,35 @@ def checar_parada():
 # =========================================================================
 # CONFIG (NAO ALTERADO)
 # =========================================================================
-Kp = 1.8 #1.6, 1,9
-Kd = 0.7 # 0.7, 0.5, 0.9
-VEL_BASE = 25 #20, 25
-VEL_MAX  = 50 #45
+Kp = 0.35 #1.6, 1,9
+Kd = 0.2 # 0.73 22.5, 0.9
+VEL_BASE = 15 #20, 25
+VEL_MAX  = 20 #45
 VEL_MIN  = -VEL_MAX
-VEL_GAP  = 25
-TEMPO_GAP_SALA_RESGATE = 3.0  # segundos em gap continuo pra considerar sala de resgate
+VEL_GAP  = 15
+TEMPO_GAP_SALA_RESGATE = 2.0  # segundos em gap continuo pra considerar sala de resgate
 LIMIAR   = 80
-DEADZONE =5 # 8, 0
-AREA_MIN = 11000
-TCRT = 6  # GPIO BCM 5
-IN1, IN2, ENA = 17, 18, 12
-IN3, IN4, ENB = 22, 23, 13
+DEADZONE = 5 # 8, 0
+TEMPO_CONFIRMACAO_VERDE = 0.15 # 0.01 (bug: janela tao curta que nunca rodava um frame de confirmacao)
+AREA_MIN = 9000 # 11000
+TCRT = 0  # GPIO BCM 5
+# IN1/IN2/ENA/IN3/IN4/ENB (L298N via GPIO) removidos - motores agora vao
+# pela placa Yahboom via serial/USB (PWM), ver bloco MOTORES mais abaixo.
 BUTTON = 24
+
+# ===================== MOTORES: placa Yahboom via serial (PWM) =====================
+# Por enquanto so PWM (malha aberta) - sem depender do encoder, que ainda
+# tem problema no lado direito (M1 sem sinal, M3 fraco). Mapeamento real
+# desse robo (nao e o padrao de fabrica da Yahboom):
+#   M1 = dianteira direita (sem encoder) | M2 = traseira esquerda
+#   M3 = traseira direita               | M4 = dianteira esquerda
+# Todo canal usa sinal invertido nesse robo (motor montado espelhado no
+# chassi) - por isso o -1 em cada valor antes de mandar.
+YAHBOOM_PORTA = "/dev/serial/by-path/platform-xhci-hcd.0-usb-0:1:1.0-port0"
+YAHBOOM_BAUDRATE = 115200
+ESCALA_PWM_YAHBOOM = 70  # converte a faixa antiga do L298N (-50..50) pra PWM Yahboom (-3600..3600)
+PWM_FREIO_YAHBOOM = 700   # forca do pulso de freio reverso ao parar
+TEMPO_FREIO_YAHBOOM = 0.08  # segundos do pulso de freio
 
 #servos
 PINO_SG90 = 5
@@ -187,35 +202,58 @@ lgpio.gpio_claim_output(h, PINO_SG90)
 lgpio.gpio_claim_output(h, PINO_PESADO)
 GPIO.gpio_claim_input(h, BUTTON, GPIO.SET_PULL_UP)
 GPIO.gpio_claim_input(h, TCRT)
-pins = [IN1, IN2, IN3, IN4, ENA, ENB]
-for p in pins:
-    GPIO.gpio_claim_output(h, p)
-GPIO.tx_pwm(h, ENA, 50, 0)
-GPIO.tx_pwm(h, ENB, 50, 0)
+# Pinos de motor (IN1..ENB) nao sao mais claimed aqui - motores agora vao
+# pela serial da placa Yahboom, nao por GPIO direto.
 
 
 # =========================================================================
-# MOTORES (NAO ALTERADO)
+# MOTORES - placa Yahboom via serial (PWM, malha aberta)
 # =========================================================================
-def aplicar_motor(in1, in2, pwm_pin, vel):
-    vel = max(min(vel, VEL_MAX), VEL_MIN)
-    if vel > 0:
-        GPIO.gpio_write(h, in1, 0)
-        GPIO.gpio_write(h, in2, 1)
-    elif vel < 0:
-        GPIO.gpio_write(h, in1, 1)
-        GPIO.gpio_write(h, in2, 0)
-    else:
-        GPIO.gpio_write(h, in1, 0)
-        GPIO.gpio_write(h, in2, 0)
-    duty = min(abs(vel), 100)
-    GPIO.tx_pwm(h, pwm_pin, 50, duty)
+motor_serial = serial.Serial(YAHBOOM_PORTA, YAHBOOM_BAUDRATE, timeout=0.5)
+
+def _enviar_pwm_yahboom(m1, m2, m3, m4):
+    m1, m2, m3, m4 = (max(-3600, min(3600, int(v))) for v in (m1, m2, m3, m4))
+    try:
+        motor_serial.write(f"$pwm:{m1},{m2},{m3},{m4}#".encode())
+    except serial.SerialException as e:
+        print(f"[MOTOR][ERRO] Falha ao mandar PWM pra placa Yahboom: {e}")
+
+_ultima_vel = (0, 0)  # (velL, velR) do ultimo mover(), pra parar() saber pra que lado frear
+
+def aplicar_motor(velL, velR):
+    """Converte velocidade esquerda/direita (faixa antiga do L298N,
+    -VEL_MAX..VEL_MAX) pra PWM da placa Yahboom nos 4 canais. Lado
+    esquerdo = M2+M4, lado direito = M1+M3 (mapeamento real desse robo -
+    ver comentario no bloco de CONFIG). Sinal invertido em todos os canais
+    porque o motor fica montado espelhado no chassi."""
+    velL = max(min(velL, VEL_MAX), VEL_MIN)
+    velR = max(min(velR, VEL_MAX), VEL_MIN)
+    pwm_esq = velL * ESCALA_PWM_YAHBOOM
+    pwm_dir = velR * ESCALA_PWM_YAHBOOM
+    # (M1, M2, M3, M4) = (direita, esquerda, direita, esquerda).
+    # OBS: o $pwm (malha aberta) saiu com o sinal ao contrario do $spd que
+    # tinhamos validado (robo foi de re) - aqui SEM o "-" extra, sinal
+    # direto, ate confirmar de novo qual convencao bate.
+    _enviar_pwm_yahboom(pwm_dir, pwm_esq, pwm_dir, pwm_esq)
 
 def mover(velL, velR):
-    aplicar_motor(IN2, IN1, ENA, velL)
-    aplicar_motor(IN4, IN3, ENB, velR)
+    global _ultima_vel
+    aplicar_motor(velL, velR)
+    _ultima_vel = (velL, velR)
 
 def parar():
+    global _ultima_vel
+    velL, velR = _ultima_vel
+    if velL != 0 or velR != 0:
+        # pulso curto reverso antes de zerar, reduz a inercia em vez de so
+        # cortar e deixar o robo deslizando - forca do freio convertida de
+        # PWM pra "unidade vel" (mesma escala do aplicar_motor) pra reusar
+        # a mesma conversao/inversao de sinal, sem duplicar logica
+        freio_vel = PWM_FREIO_YAHBOOM / ESCALA_PWM_YAHBOOM
+        freio_esq = -freio_vel if velL > 0 else (freio_vel if velL < 0 else 0)
+        freio_dir = -freio_vel if velR > 0 else (freio_vel if velR < 0 else 0)
+        aplicar_motor(freio_esq, freio_dir)
+        time.sleep(TEMPO_FREIO_YAHBOOM)
     mover(0, 0)
 
 def angulo(ang):
@@ -973,15 +1011,25 @@ def check_green(contours_grn, black_image, green_image):
     pixels_verde = cv2.countNonZero(green_image)
     print(pixels_verde)
 
-    contador_180 = contador_180 + 1 if turn_180 else 0
-    contador_esquerda = contador_esquerda + 1 if turn_left else 0
-    contador_direita = contador_direita + 1 if turn_right else 0
+    # Antes zerava o contador inteiro no primeiro frame que perdesse o voto -
+    # bastava UM frame ruim (blur, angulo, luz) no meio de uma sequencia boa
+    # pra derrubar tudo e o robo "nao ver" a placa a tempo dela sair do
+    # quadro. Agora decai 1 por vez em vez de zerar, entao um frame perdido
+    # isolado nao apaga o progresso acumulado.
+    contador_180 = contador_180 + 1 if turn_180 else max(contador_180 - 1, 0)
+    contador_esquerda = contador_esquerda + 1 if turn_left else max(contador_esquerda - 1, 0)
+    contador_direita = contador_direita + 1 if turn_right else max(contador_direita - 1, 0)
 
     if turn_180:
         return "GIRAR_180"
-    elif turn_left and pixels_verde < 15500 and contador_esquerda > 2 and contador_direita < 1:
+    # A exclusao mutua (nao estar vendo o outro lado) usa o voto CRU do
+    # frame atual (turn_right/turn_left), nao o contador com decaimento -
+    # contador_direita agora fica "residual" por alguns frames depois de um
+    # voto isolado de ruido, e usar ele aqui bloqueava ESQUERDA mesmo com o
+    # robo ja vendo ESQUERDA de novo no frame atual.
+    elif turn_left and pixels_verde < 15500 and contador_esquerda > 2 and not turn_right:
         return "ESQUERDA"
-    elif turn_right and pixels_verde < 15500 and contador_direita > 2 and contador_esquerda < 1:
+    elif turn_right and pixels_verde < 15500 and contador_direita > 2 and not turn_left:
         return "DIREITA"
     else:
         return "RETO"
@@ -1214,76 +1262,85 @@ def desvio():
     # saber que nao esta na gangorra).
     if not (-5 < angulo_y() < 3):
         return
-    if distancia_frente() <= 6:
+    if distancia_frente() <= 5:
         # O Arduino alterna F/E a cada 60ms, entao cada sonar so atualiza a
         # cada ~120ms. Um sleep menor que isso reconfere o MESMO valor em
         # cache, nao uma leitura nova - por isso 0.15s aqui, nao 0.09s.
-        time.sleep(0.15)
+        mover(-2,-2)
+        time.sleep(0.09)
+        mover(-2,-2)
+        time.sleep(0.1)
         if distancia_frente() <= 5:
-            mover(30, 30)
-            mover(-30, -30)
+            mover(18, 18)
+            mover(-18, -18)
             time.sleep(0.2)
-            mover(-10, -10)
+            mover(-2, -2)
             time.sleep(0.1)
 
-            guinada_pid("D", 90)
+            guinada2("D", 100,18)
+            time.sleep(0.2)
 
             while True:
                 checar_parada()
-                mover(30, 30)
+                mover(18, 18)
                 if distancia_esquerda() < 15:
-                    mover(-10, -10)
-                    time.sleep(0.2)
+                    mover(-2, -2)
+                    time.sleep(0.8)
                     break
                 time.sleep(0.005)
 
             while True:
                 checar_parada()
-                mover(35, 35)
+                mover(18, 18)
                 if distancia_esquerda() > 20:
-                    mover(-10, -10)
+                    mover(-2, -2)
                     time.sleep(0.2)
                     break
                 time.sleep(0.005)
-
-            guinada_pid("E", 90)
+            time.sleep(0.2)
+            guinada2("E", 90,18)
             while True:
                 checar_parada()
-                mover(30, 30)
+                mover(18, 18)
                 if distancia_esquerda() < 20:
-                    mover(30, 30)
+                    mover(15, 15)
                     time.sleep(0.2)
-                    mover(-10, -10)
+                    mover(-2, -2)
                     time.sleep(0.3)
                     break
                 time.sleep(0.005)
 
             while True:
                 checar_parada()
-                mover(30, 30)
+                mover(18, 18)
                 if distancia_esquerda() > 17:
-                    mover(40, 40)
-                    time.sleep(0.4)
-                    mover(-10, -10)
+                    mover(20, 20)
+                    time.sleep(0.5)
+                    mover(-2, -2)
                     time.sleep(0.3)
                     break
                 time.sleep(0.005)
 
-            guinada_pid("E", 84)
+            guinada2("E", 94,18)
             while True:
                 checar_parada()
-                mover(30, 30)
-                if distancia_esquerda() < 20:
-                    mover(-40, -40)
-                    time.sleep(0.3)
-                    mover(10, 10)
-                    time.sleep(0.3)
+                mover(18, 18)
+                if distancia_esquerda() < 17:
+                   
+                    mover(18, 18)
+                    time.sleep(0.2)
+                    mover(-2, -2)
+                    time.sleep(0.9)
                     break
                 time.sleep(0.005)
 
-            guinada_pid("D", 90)
-            mover(-30, -30)
-            time.sleep(0.4)
+            guinada2("D", 90,18)
+            mover(-18, -18)
+            time.sleep(0.3)
+            mover(2,2)
+            time.sleep(0.9)
+            mover(0,0)
+            time.sleep(0.8)
 
 
 def verde(roi):
@@ -1301,7 +1358,7 @@ def verde(roi):
     inicio_confirmacao = time.time()
     acao_confirmada = acao_verde
 
-    while time.time() - inicio_confirmacao < 0.01:
+    while time.time() - inicio_confirmacao < TEMPO_CONFIRMACAO_VERDE:
         checar_parada()
         ret, frame_conf = cap.read()
         if not ret:
@@ -1317,12 +1374,14 @@ def verde(roi):
   
 
     if acao_verde == "ESQUERDA":
-        mover(-10, -10)
+        mover(-2, -2)
         time.sleep(0.1)
-        mover(30, 30)
-        time.sleep(0.18)
+        mover(15, 15)
+        time.sleep(0.25)
         parar()
-        guinada2('E', 85, 35)
+        guinada2('E', 92, 20)
+        mover(15,15)
+        time.sleep(0.2)
         inicio = time.time()
         while time.time() - inicio < 1.0:
             checar_parada()
@@ -1334,12 +1393,14 @@ def verde(roi):
 
     elif acao_verde == "DIREITA":
         limpar_camera(10)
-        mover(-10, -10)
+        mover(-2, -2)
         time.sleep(0.1)
-        mover(30, 30)
-        time.sleep(0.18)
+        mover(15, 15)
+        time.sleep(0.25)
         parar()
-        guinada2('D', 85, 35)
+        guinada2('D', 92, 20)
+        mover(15,15)
+        time.sleep(0.2)
         inicio = time.time()
         while time.time() - inicio < 1.0:
             checar_parada()
@@ -1351,12 +1412,12 @@ def verde(roi):
 
     elif acao_verde == "GIRAR_180":
         print("gira 180")
-        mover(-12, -12)
+        mover(-2, -2)
         time.sleep(0.09)
-        guinada_pid("D", 160)
-        mover(30, 30)
-        time.sleep(0.19)
-        mover(-10, -10)
+        guinada2("D",170,20)
+        mover(15, 15)
+        time.sleep(0.22)
+        mover(-2, -2)
         time.sleep(0.2)
         parar()
         limpar_camera(10)
@@ -1466,14 +1527,20 @@ def controle(cx, contours, roi):
     else:
         erro = ultimo_erro
 
-    if abs(erro) < DEADZONE:
-        erro = 0
     if gap_debug(contours):
         erro = 0
 
     derivada = (erro - ultimo_erro) / dt
     derivada = np.clip(derivada, -300, 300)
-    ajuste = (Kp * erro) + (Kd * derivada)
+
+    # Deadzone so no ajuste final, nao no erro em si - zerar o erro ANTES de
+    # calcular a derivada corrompia o termo D (pico artificial de -ultimo_erro/dt
+    # toda vez que entrava na deadzone vindo de um erro grande), causando as
+    # guinadas bruscas que a deadzone deveria estar evitando.
+    if abs(erro) < DEADZONE:
+        ajuste = 0
+    else:
+        ajuste = (Kp * erro) + (Kd * derivada)
 
     print("angulo y ",angulo_y())
     if -5 < angulo_y() < 3 and contador_gangorra != 2:
@@ -1482,9 +1549,9 @@ def controle(cx, contours, roi):
     
     if angulo_y() <= -16:
         contador_gangorra = 2
-        velocidade_base = 45
-        velL = np.clip(velocidade_base + ajuste, 20, 100)
-        velR = np.clip(velocidade_base - ajuste, 20, 100)
+        velocidade_base = 20
+        velL = np.clip(velocidade_base + ajuste, VEL_MIN, VEL_MAX)
+        velR = np.clip(velocidade_base - ajuste, VEL_MIN, VEL_MAX)
     else:
         velocidade_base = VEL_BASE
         velL = np.clip(velocidade_base + ajuste, VEL_MIN, VEL_MAX)
@@ -1501,6 +1568,8 @@ def controle(cx, contours, roi):
         velocidade_base = 20
         velL = velocidade_base + ajuste
         velR = velocidade_base - ajuste
+
+   
     mover(velL, velR)
     ultimo_erro = erro
 
