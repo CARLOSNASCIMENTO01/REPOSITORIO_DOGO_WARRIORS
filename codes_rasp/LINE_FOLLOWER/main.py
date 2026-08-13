@@ -178,8 +178,10 @@ if __name__ == "__main__":
     # podia jogar o offset de "parado" pra um valor errado.
     config.robo_ativo.set()
     config.angulo(150)
-    config.angulo(0)
     if "--auto" in sys.argv:
+        # Vindo do resgate - garra so ate 90, nao fecha/desce toda (pedido
+        # explicito: voltando pro seguidor a garra nao pode descer toda).
+        config.angulo(90)
         # ja comeca ativo (vindo do resgate) - servo pesado levantado.
         # mover_servo_direto() aqui de proposito, nao mover_servo(): logo no
         # boot o codigo nao faz ideia de onde o servo pesado fisicamente esta
@@ -189,6 +191,7 @@ if __name__ == "__main__":
         # no inicio da rampa em vez de simplesmente ir direto pro alvo.
         config.mover_servo_direto(config.PINO_PESADO, config.SERVO_PESADO_ANGULO_ATIVO)
     else:
+        config.angulo(0)
         # esperando o botao pra comecar - servo pesado abaixado, indicando parado
         config.mover_servo_direto(config.PINO_PESADO, config.SERVO_PESADO_ANGULO_PARADO)
         config.robo_ativo.clear()

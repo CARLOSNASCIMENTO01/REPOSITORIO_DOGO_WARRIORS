@@ -89,7 +89,7 @@ ESCALA_PWM_YAHBOOM = 70  # converte a faixa antiga do L298N (-50..50) pra PWM Ya
 PWM_FREIO_YAHBOOM = 700   # forca do pulso de freio reverso ao parar
 TEMPO_FREIO_YAHBOOM = 0.08  # segundos do pulso de freio
 
-VEL_MAX = 20 #20
+VEL_MAX = 22#20
 VEL_MIN = -VEL_MAX
 
 ANGULO_INICIAL = 90

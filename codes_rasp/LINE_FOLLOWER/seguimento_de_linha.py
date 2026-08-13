@@ -110,9 +110,9 @@ def limpar_camera(n=5):
 # =========================================================================
 # CONTROLE (segue linha) - PID
 # =========================================================================
-Kp = 0.7 #0.9
-Kd = 0.3 # 0.3
-VEL_BASE = 15 #15
+Kp = 0.9 #0.9
+Kd = 0.25 # 0.3
+VEL_BASE = 18 #15
 DEADZONE = 0 # 8, 0
 
 contador_gangorra = 0
@@ -161,27 +161,63 @@ def controle(cx, contours, roi):
     mask_verde_ctrl = cv2.inRange(hsv_ctrl, green_min, green_max)
     pixels_verde_ctrl = cv2.countNonZero(mask_verde_ctrl)
 
-    if config.angulo_y() <= -13:
+    if config.angulo_y() <= -10:
         contador_gangorra = 2
-        velocidade_base = 25
+        velocidade_base = 26
         velL = np.clip(velocidade_base + ajuste, config.VEL_MIN, config.VEL_MAX)
         velR = np.clip(velocidade_base - ajuste, config.VEL_MIN, config.VEL_MAX)
-    elif pixels_verde_ctrl > 9000:
+    elif pixels_verde_ctrl > 10000:
         print(f"[VERDE-CONTROLE] pixels_verde={pixels_verde_ctrl} - freando")
-        velocidade_base = 10
-        velL = np.clip(velocidade_base + ajuste, -12, 12)
-        velR = np.clip(velocidade_base - ajuste, -12, 12)
-        if pixels_verde_ctrl > 22000:
-            print("gira 180")
-            config.mover(-2, -2)
-            time.sleep(0.3)
-            movimentos_bases.guinada2("D", 170, 20)
-            config.mover(15, 15)
-            time.sleep(0.22)
-            config.mover(-2, -2)
-            time.sleep(0.2)
-            config.parar()
-            limpar_camera(10)
+        
+        velocidade_base = 12
+        velL = np.clip(velocidade_base + ajuste, -13, 13)
+        velR = np.clip(velocidade_base - ajuste, -13, 13)
+        if pixels_verde_ctrl > 24000:
+            # So vira se o verde nao estiver mais "colado" numa linha preta
+            # continuando embaixo dele - reusa o check_black() (o mesmo
+            # calculo que ja faz um marcador unico ser ignorado quando
+            # ainda esta apos uma linha preta, ainda nao chegou) em cima
+            # de so UM dos contornos verdes achados aqui. Nao precisa dos
+            # dois marcadores nem de nenhuma deteccao nova - so o sinal
+            # "baixo" (preto colado embaixo do verde = linha ainda
+            # conectada = nao chegou de verdade) que ja existe.
+            hsv_verde_ref = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            green_mask_ref = cv2.inRange(hsv_verde_ref, green_min, green_max)
+            green_mask_ref = cv2.dilate(green_mask_ref, kernal, iterations=3)
+            green_mask_ref = cv2.erode(green_mask_ref, kernal, iterations=2)
+            contornos_verde_ref, _ = cv2.findContours(green_mask_ref, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+            contornos_verde_ref = [c for c in contornos_verde_ref if cv2.contourArea(c) > MIN_GREEN_AREA]
+
+            apos_linha_preta = False
+            if contornos_verde_ref:
+                roi_h_ref, _ = roi.shape[:2]
+                corte_top_ref = int(roi_h_ref * 0.4)
+                black_ref = cv2.inRange(roi, black_min, black_max_bot)
+                black_ref[:corte_top_ref, :] = cv2.inRange(roi[:corte_top_ref, :], black_min, black_max_top)
+                black_ref = cv2.dilate(black_ref, kernal, iterations=3)
+                black_ref = cv2.erode(black_ref, kernal, iterations=2)
+
+                green_box_ref = cv2.boxPoints(cv2.minAreaRect(contornos_verde_ref[0]))
+                row_ref = check_black(np.zeros((1, 5), dtype=np.int16), 0, green_box_ref, black_ref)
+                apos_linha_preta = row_ref[0, 0] == 1  # baixo=1 -> linha preta ainda conectada embaixo
+                print(f"[VERDE-REF] contornos_verde={len(contornos_verde_ref)} box={green_box_ref.tolist()} "
+                      f"voto(baixo,cima,esq,dir)={row_ref[0, :4].tolist()} apos_linha_preta={apos_linha_preta}")
+            else:
+                print("[VERDE-REF] nenhum contorno verde grande achado pra referencia")
+
+            if apos_linha_preta:
+                print(f"[VERDE-CONTROLE] pixels_verde={pixels_verde_ctrl} - verde apos linha preta, ignorando giro")
+            else:
+                print("gira 180")
+                config.mover(-2, -2)
+                time.sleep(0.3)
+                movimentos_bases.guinada2("D", 170, 20)
+                config.mover(15, 15)
+                time.sleep(0.22)
+                config.mover(-2, -2)
+                time.sleep(0.2)
+                config.parar()
+                limpar_camera(10)
         """if pixels_verde_ctrl > 22000:
             print(f"[VERDE-CONTROLE] pixels_verde={pixels_verde_ctrl} - muito perto/parado, recuando")
             inicio_caso_verde = time.time()
@@ -243,7 +279,7 @@ green_max = np.array([89, 255, 255]) #85, 255, 255
 black_min     = np.array([0, 0, 0])
 black_max_top = np.array([78, 78, 78]) #90, 90, 90
 black_max_bot = np.array([91, 91, 91]) #135, 135, 135
-MIN_GREEN_AREA = 1000 #2500
+MIN_GREEN_AREA = 1500 #2500
 LIMIAR_PIXELS_VERDE_OUTRO_LADO = 1500  # verde do lado oposto acima disso = pode ser o 2o marcador do 180 comecando a aparecer
 
 DEBUG_VERDE = True
@@ -344,18 +380,19 @@ def check_green(contours_grn, black_image, green_image):
     pixels_verde = cv2.countNonZero(green_image)
     print("pixel verde", pixels_verde)
 
-    #contador_180 = contador_180 + 1 if turn_180 else 0
+    contador_180 = contador_180 + 1 if turn_180 else 0
     contador_esquerda = contador_esquerda + 1 if turn_left else 0
     contador_direita = contador_direita + 1 if turn_right else 0
     turn_left, turn_right, turn_180 = determine_turn_direction(black_around_sign, green_centers)
     if turn_180:
-        return "GIRAR_180"
-    elif turn_left and pixels_verde < 15500 and contador_esquerda > 2 and contador_direita < 1:
-        return "ESQUERDA"
-    elif turn_right and pixels_verde < 15500 and contador_direita > 2 and contador_esquerda < 1:
-        return "DIREITA"
+        caso = "GIRAR_180"
+    elif turn_left and pixels_verde < 22000 and contador_esquerda > 2 and contador_direita < 1:  #15500
+        caso = "ESQUERDA"
+    elif turn_right and pixels_verde < 22000 and contador_direita > 2 and contador_esquerda < 1:  #15500
+        caso = "DIREITA"
     else:
-        return "RETO"
+        caso = "RETO"
+    return caso
     
     """if turn_180:
         return "GIRAR_180"
@@ -444,13 +481,15 @@ def verde(roi):
     if acao_verde == "ESQUERDA":
         print("verde_esquerda")
         config.mover(-2, -2)
-        time.sleep(0.9)
-        config.mover(15, 15)
-        time.sleep(0.25)
-        config.parar()
-        movimentos_bases.guinada2('E', 88, 20)
-        config.mover(15, 15)
         time.sleep(0.2)
+        config.mover(15, 15)
+        time.sleep(0.3)
+        config.parar()
+        movimentos_bases.guinada2('E', 85, 20)
+        config.mover(15, 15)
+        time.sleep(0.3)
+        config.mover(-2, -2)
+        time.sleep(0.1)
         inicio = time.time()
         while time.time() - inicio < 1.0:
             config.checar_parada()
@@ -464,13 +503,15 @@ def verde(roi):
         print("verde_direita")
         limpar_camera(10)
         config.mover(-2, -2)
-        time.sleep(0.9)
-        config.mover(15, 15)
-        time.sleep(0.25)
-        config.parar()
-        movimentos_bases.guinada2('D', 88, 20)
-        config.mover(15, 15)
         time.sleep(0.2)
+        config.mover(15, 15)
+        time.sleep(0.3)
+        config.mover(-2, -2)
+        time.sleep(0.1)
+        config.parar()
+        movimentos_bases.guinada2('D', 85, 20)
+        config.mover(15, 15)
+        time.sleep(0.3)
         inicio = time.time()
         while time.time() - inicio < 1.0:
             config.checar_parada()
