@@ -5,6 +5,8 @@ import lgpio
 import numpy as np
 import sys
 import os
+import fcntl
+import subprocess
 import threading
 import smbus2
 import serial
@@ -54,15 +56,15 @@ def botao_thread():
                     # robo_ativo) e mataria essa propria thread. Por isso usa
                     # a versao direta, sem checagem.
                     try:
-                        mover_servo_direto(PINO_PESADO, SERVO_PESADO_ANGULO_PARADO)
-                        _angulo_atual[PINO_PESADO] = SERVO_PESADO_ANGULO_PARADO
+                        mover_servo_direto(PINO_PESADO, 90, manter_pulso=True)
+                        _angulo_atual[PINO_PESADO] = 90
                     except Exception as e:
                         print(f"[BOTAO][ERRO] Falha ao abaixar servo pesado: {e}")
                 else:
                     print("[BOTAO] REINICIANDO...")
                     robo_ativo.set()
                     try:
-                        mover_servo_direto(PINO_PESADO, SERVO_PESADO_ANGULO_ATIVO)
+                        mover_servo_direto(PINO_PESADO, SERVO_PESADO_ANGULO_ATIVO, manter_pulso=True)
                         _angulo_atual[PINO_PESADO] = SERVO_PESADO_ANGULO_ATIVO
                     except Exception as e:
                         print(f"[BOTAO][ERRO] Falha ao levantar servo pesado: {e}")
@@ -285,7 +287,7 @@ kernel_tri = np.ones((3, 3), np.uint8)
 
 PROPORCAO_ESPERADA = 30 / 6
 TOLERANCIA_PROPORCAO = 0.8
-AREA_MIN_TRI = 500
+AREA_MIN_TRI = 2500 #500 - baixo demais, deixava passar ruido pequeno (blob de ~510px que nao era triangulo nenhum)
 AREA_MAX_TRI = 1000000
 
 STOP_AREA_RATIO_TRIANGULO = 0.80   # ajustar na prática, igual fizemos com a bola
@@ -309,6 +311,12 @@ CROP_W, CROP_H = 320, 240
 CONF_THRES = 0.35
 IMG_CENTER_X = CROP_W // 2
 TOLERANCE = 30
+
+# Modo debug visual: True abre as janelas de deteccao de vitima (bola,
+# detectar_bola()) e de triangulo/canto (detectar_entrega()) - precisa de
+# display (X11/VNC), NAO liga isso rodando headless (ex: pelo robo.service),
+# cv2.imshow() derruba o processo sem tela.
+DEBUG_VISUAL = False
 
 # IN1/IN2/ENA/IN3/IN4/ENB (L298N via GPIO) removidos - motores agora vao
 # pela placa Yahboom via serial/USB (PWM), portado do seguidor_debug2_yahboom.py.
@@ -402,13 +410,13 @@ def watchdog_seguranca():
             _ultimo_heartbeat[0] = time.time()  # evita disparar de novo a cada 0.5s
 
 # ===================== APROXIMAÇÃO POR TAMANHO DE BBOX =====================
-APPROACH_SPEED = 20        # velocidade do avanço durante a aproximação
-APPROACH_STEP_TIME = 0.15  # duração de cada "passo" de avanço/correção
-STOP_AREA_RATIO = 0.35     # bbox_area / crop_area -> ajustar na prática!
+APPROACH_SPEED = 25#23        # velocidade do avanço durante a aproximação
+APPROACH_STEP_TIME = 0.18  # duração de cada "passo" de avanço/correção
+STOP_AREA_RATIO = 0.85     # bbox_area / crop_area -> ajustar na prática!
 MAX_APPROACH_STEPS = 60    # trava de segurança (evita loop infinito)
 LOST_BALL_FRAMES = 8       # quantos frames sem detectar até desistir
-TURN_PULSE = 0.2
-STOP_TIME = 0.2
+TURN_PULSE = 0.16
+STOP_TIME = 0.2#0.2
 FORWARD_TIME = 0.6
 
 # ===================== CENTRALIZAÇÃO PROPORCIONAL =====================
@@ -418,7 +426,7 @@ CENTER_MAX_TENTATIVAS = 15
 CENTER_LOST_FRAMES = 5
 
 
-MAX_ENTREGAS = 3
+MAX_ENTREGAS = 0
 BUSCA_FINAL_MAX_GIROS = 20  # ajustar na prática
 
 # ===================== CÂMERA DE BAIXO (linha/chão) - usada só na saída =====================
@@ -431,8 +439,8 @@ CAMERA_INDEX_LINHA = "/dev/v4l/by-id/usb-Jieli_Technology_USB_Composite_Device-v
 USAR_TCRT_PARA_LINHA = False
 CAMERA_LINHA_INDEX_FALLBACK = 0
 LINHA_W, LINHA_H = 160, 120
-LIMIAR_LINHA = 80
-AREA_MIN_LINHA = 11000
+LIMIAR_LINHA = 80  # calibrado ao vivo, era 80
+AREA_MIN_LINHA = 11000  # calibrado ao vivo, era 11000
 kernel_linha = np.ones((3, 3), np.uint8)
 
 # ===================== LIMIARES DA SAÍDA (acionar_saida) =====================
@@ -873,7 +881,18 @@ def buscar_bola():
     """
     Gira no lugar até achar qualquer bola (usado só na busca final,
     depois da 3ª entrega). Retorna True se achou.
+
+    Ignora deteccao muito efemera (1-2 frames so, tipo ruido/sombra/
+    reflexo do YOLO) - exige a bola aparecer em CONFIRMACAO_BUSCA_FINAL
+    leituras seguidas, sem girar mais, antes de considerar achada de
+    verdade. Sem isso, um falso positivo de UM frame ja fazia
+    buscar_bola() retornar True e a saida inteira era abortada - essa
+    checagem so roda uma vez (logo apos a entrega que bate MAX_ENTREGAS),
+    entao um erro aqui nunca era corrigido depois: o robo voltava pro
+    loop normal de busca e ficava so girando, sem nunca tentar
+    acionar_saida() de novo.
     """
+    CONFIRMACAO_BUSCA_FINAL = 3
     for _ in range(BUSCA_FINAL_MAX_GIROS):
         checar_parada()
         turn_right(speed=55)
@@ -886,8 +905,23 @@ def buscar_bola():
             continue
 
         cx, area, bbox, cls_id = detectar_bola(crop)
-        if cx is not None:
+        if cx is None:
+            continue
+
+        confirmacoes = 1
+        for _ in range(CONFIRMACAO_BUSCA_FINAL - 1):
+            checar_parada()
+            crop_confirma = capturar_crop()
+            if crop_confirma is None:
+                break
+            cx_confirma, _, _, _ = detectar_bola(crop_confirma)
+            if cx_confirma is None:
+                break
+            confirmacoes += 1
+
+        if confirmacoes >= CONFIRMACAO_BUSCA_FINAL:
             return True
+        print(f"[BUSCA FINAL] Deteccao efemera descartada ({confirmacoes}/{CONFIRMACAO_BUSCA_FINAL} frames), continuando busca")
     return False
 
 
@@ -920,17 +954,17 @@ def guinada2(LADO, GRAUS, VELOCIDADE):
     resetar_giroscopio()
 
 
-AREA_MAX_LINHA_FRAC = 0.5  # linha de verdade e fina, nao deveria cobrir mais que isso da ROI
+AREA_MAX_LINHA_FRAC = 0.5  # calibrado ao vivo, era 0.5
+TOLERANCIA_ANGULO_VERTICAL_LINHA = 30  # calibrado ao vivo, era 30
 
-def detectar_linha_embaixo(frame):
-    """
-    Mesma logica de deteccao de linha usada em obstaculos_trajeto.desvio()
-    (LINE_FOLLOWER) pra voltar pra linha - nao so o maior contorno preto
-    passar de AREA_MIN_LINHA, tambem rejeita contorno grande demais (mais
-    da metade da ROI). Sem esse teto, um fundo/branco mal iluminado sendo
-    lido como "preto" pelo LIMIAR_LINHA baixo passava por linha de
-    verdade (mesmo bug ja visto e corrigido no desvio() do obstaculo).
-    """
+def _maior_contorno_linha(frame):
+    """Acha o maior contorno preto valido (area dentro de AREA_MIN_LINHA e
+    AREA_MAX_LINHA_FRAC) na camera de baixo. Retorna o contorno ou None.
+    Mesma logica de deteccao usada em obstaculos_trajeto.desvio()
+    (LINE_FOLLOWER) pra voltar pra linha - o teto de area evita que um
+    fundo/branco mal iluminado, lido como "preto" pelo LIMIAR_LINHA baixo,
+    passe por linha de verdade (mesmo bug ja visto e corrigido no
+    desvio() do obstaculo)."""
     h_, w_ = frame.shape[:2]
     roi = frame[int(h_ * 0.1):h_, :]
 
@@ -940,39 +974,158 @@ def detectar_linha_embaixo(frame):
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return False
+        return None
 
     maior = max(contours, key=cv2.contourArea)
     area_contorno = cv2.contourArea(maior)
     area_roi = roi.shape[0] * roi.shape[1]
 
     if area_contorno < AREA_MIN_LINHA:
-        return False
+        return None
     if area_contorno >= area_roi * AREA_MAX_LINHA_FRAC:
+        return None
+    return maior
+
+
+def detectar_linha_embaixo(frame):
+    """Qualquer contorno preto valido, sem restricao de orientacao - usado
+    nas checagens auxiliares da saida (varredura lateral, confirmar
+    abertura, realinhar), onde so importa saber se tem "alguma coisa"
+    por perto."""
+    return _maior_contorno_linha(frame) is not None
+
+
+def detectar_linha_vertical_embaixo(frame):
+    """Igual detectar_linha_embaixo(), mas so aceita se o contorno for
+    VERTICAL (sentido de deslocamento do robo) - marca a ENTRADA da area
+    de resgate (o robo ja veio de la, deve recuar e ir pro outro lado, nao
+    sair pro seguidor - ver acionar_saida()). fitLine() acha o eixo
+    principal de verdade do contorno via ajuste de reta, robusto a
+    inclinacao (diferente de so comparar largura x altura do bounding
+    box, que erra pra contorno na diagonal)."""
+    maior = _maior_contorno_linha(frame)
+    if maior is None:
         return False
-    return True
+
+    vx, vy, _, _ = cv2.fitLine(maior, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+    desvio_vertical = math.degrees(math.atan2(abs(float(vx)), abs(float(vy))))
+    return desvio_vertical <= TOLERANCIA_ANGULO_VERTICAL_LINHA
+
+
+LIMIAR_LINHA_H = 123  # calibrado ao vivo, era 123
+AREA_MIN_LINHA_H = 20000  # calibrado ao vivo, era 20000
+AREA_MAX_LINHA_FRAC_H = 0.81  # calibrado ao vivo, era 0.81
+TOLERANCIA_ANGULO_HORIZONTAL_LINHA = 58  # calibrado ao vivo, era 58
+
+
+def _maior_contorno_linha_h(frame):
+    """Igual _maior_contorno_linha(), mas com limiares proprios
+    (LIMIAR_LINHA_H/AREA_MIN_LINHA_H/AREA_MAX_LINHA_FRAC_H) - calibrados
+    separado da entrada (vertical), ver detectar_linha_horizontal_embaixo()."""
+    h_, w_ = frame.shape[:2]
+    roi = frame[int(h_ * 0.1):h_, :]
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    mask = cv2.threshold(gray, LIMIAR_LINHA_H, 255, cv2.THRESH_BINARY_INV)[1]
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_linha)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    maior = max(contours, key=cv2.contourArea)
+    area_contorno = cv2.contourArea(maior)
+    area_roi = roi.shape[0] * roi.shape[1]
+
+    if area_contorno < AREA_MIN_LINHA_H:
+        return None
+    if area_contorno >= area_roi * AREA_MAX_LINHA_FRAC_H:
+        return None
+    return maior
+
+
+def detectar_linha_horizontal_embaixo(frame):
+    """Igual detectar_linha_vertical_embaixo(), mas so aceita contorno
+    HORIZONTAL - marca a SAIDA de verdade (hora de ir pro seguidor), ao
+    contrario do vertical que marca a entrada."""
+    maior = _maior_contorno_linha_h(frame)
+    if maior is None:
+        return False
+
+    vx, vy, _, _ = cv2.fitLine(maior, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+    desvio_vertical = math.degrees(math.atan2(abs(float(vx)), abs(float(vy))))
+    desvio_horizontal = 90 - desvio_vertical
+    return desvio_horizontal <= TOLERANCIA_ANGULO_HORIZONTAL_LINHA
 
 
 VEL_SAIDA = 15  # velocidade continua do trecho reto de acionar_saida()
 
+TEMPO_MAX_CONFIRMAR_LATERAL = 1.0  # segundos avancando tentando ver contorno preto na abertura
+
+
+def confirmar_saida_lateral():
+    
+    achou = False
+    inicio = time.time()
+    while time.time() - inicio < 3.0:
+        checar_parada()
+        mover(VEL_SAIDA, VEL_SAIDA)
+        if cap_linha is not None:
+            ret_l3, frame_l3 = cap_linha.read()
+            if ret_l3 and detectar_linha_embaixo(frame_l3):
+                achou = True
+                break
+        time.sleep(0.02)
+    parar_motores()
+    return achou
+
+
+def alinhar_na_linha():
+    """Vai pra frente, guinada pra esquerda (passa da linha de proposito),
+    e volta corrigindo pra direita ate ver o contorno de novo - manobra
+    de sempre, mas usando a tecnica de deteccao/confirmacao de
+    obstaculos_trajeto.desvio() (LINE_FOLLOWER): cx do maior contorno
+    preto valido (_maior_contorno_linha(), mesma logica de area minima/
+    maxima usada em visao()+gap_debug() do seguidor), exige varios frames
+    seguidos com o cx dentro da tolerancia do centro antes de aceitar -
+    evita alinhar em cima de uma leitura isolada/ruidosa. Movimento
+    continuo (sem parar entre passos), mesmo estilo do desvio().
+    Usa cap_linha (global, aberta por abrir_camera_linha())."""
+    mover(20, 20)
+    time.sleep(0.6)
+    guinada2('E', 8, 15)
+
+    TOLERANCIA_CENTRO_LINHA = 30
+    FRAMES_CONFIRMACAO = 3
+    ALINHAR_VEL = 13
+    frames_centralizado_seguidos = 0
+    while True:
+        checar_parada()
+        mover(ALINHAR_VEL, -ALINHAR_VEL)
+        ret_l, frame_l = cap_linha.read()
+        if ret_l:
+            maior = _maior_contorno_linha(frame_l)
+            cx = None
+            if maior is not None:
+                M = cv2.moments(maior)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+            centro = frame_l.shape[1] // 2
+            centralizado = cx is not None and abs(cx - centro) < TOLERANCIA_CENTRO_LINHA
+            frames_centralizado_seguidos = frames_centralizado_seguidos + 1 if centralizado else 0
+            print(f"[SAIDA-ALINHA] cx={cx} centralizado={centralizado} seguidos={frames_centralizado_seguidos}")
+            if frames_centralizado_seguidos >= FRAMES_CONFIRMACAO:
+                print("[SAIDA] Contorno da linha encontrado de novo, alinhado")
+                break
+        time.sleep(0.005)
+    parar_motores()
+
 
 def acionar_saida():
-    """
-    Roda uma vez so, depois da ultima entrega. Primeiro procura o canto
-    verde mais proximo, centraliza nele e VAI ATE ELE (mesmas buscar/
-    centralizar/aproximar triangulo usadas em entregar_bola(), so que
-    filtradas pra 'verde') - so depois de chegar no canto e que comeca o
-    movimento continuo de identificacao dos tres sinais de saida:
-      - canto verde OU vermelho na camera de resgate (achou outra quina,
-        de qualquer cor - o filtro fica so em 'verde' durante o alinhamento
-        inicial, depois solta pra None)
-      - linha preta na camera de baixo (achou a pista)
-      - ultrassonico lateral aberto (saiu pra um corredor)
-    Retorna uma string dizendo qual dos tres foi o gatilho.
-    """
+   
     global ALVO_COR
     print("[SAIDA] Procurando canto verde para se alinhar...")
-    ALVO_COR = "verde"
+    ALVO_COR = "verde" #MUDA AQUIIIIIIIIIIIIII!
 
     # Nao pode desistir na primeira falha de centralizar/aproximar - reposiciona
     # (mesmo recuo usado em entregar_bola()) e tenta achar o canto de novo, ate
@@ -980,32 +1133,35 @@ def acionar_saida():
     # vez do alcance da camera).
     MAX_TENTATIVAS_ALINHAR_CANTO = 5
     alinhou_no_canto = False
+    tentativas_reposicionar = 0
     for _ in range(MAX_TENTATIVAS_ALINHAR_CANTO):
         checar_parada()
 
         if not buscar_triangulo():
             print("[SAIDA] Canto verde nao encontrado, reposicionando e tentando de novo...")
-            mover(-15, -15)
-            time.sleep(0.4)
-            mover(-30, 0)
-            time.sleep(0.2)
+            tentativas_reposicionar += 1
+            reposicionar_canto(tentativas_reposicionar, vel_recuo=15)
             continue
+
+        # Recua um pouco antes de centralizar - da mais espaco pra
+        # recalcular o centro do canto com mais precisao, em vez de
+        # centralizar em cima da primeira leitura que achou o canto
+        # (pode estar mal enquadrada, perto/de lado demais).
+        '''mover(-25, -25)
+        time.sleep(0.8)
+        parar_motores()'''
 
         if not centralizar_triangulo():
             print("[SAIDA] Nao conseguiu centralizar no canto verde, reposicionando e tentando de novo...")
-            mover(-15, -15)
-            time.sleep(0.4)
-            mover(-30, 0)
-            time.sleep(0.2)
+            tentativas_reposicionar += 1
+            reposicionar_canto(tentativas_reposicionar, vel_recuo=15)
             continue
 
         print("[SAIDA] Indo ate o canto verde...")
         if not aproximar_triangulo():
             print("[SAIDA] Nao conseguiu chegar no canto verde, reposicionando e tentando de novo...")
-            mover(-15, -15)
-            time.sleep(0.4)
-            mover(-30, 0)
-            time.sleep(0.2)
+            tentativas_reposicionar += 1
+            reposicionar_canto(tentativas_reposicionar, vel_recuo=15)
             continue
 
         alinhou_no_canto = True
@@ -1028,12 +1184,14 @@ def acionar_saida():
     time.sleep(1.5)
     mover(-20,-20)
     time.sleep(0.7)
-    guinada2('E', 175, 20)
+    guinada2('E', 170, 20)
     mover(-25,-25)
     time.sleep(3.5)
+    mover(25,25)
+    time.sleep(0.15)
     guinada2('E', 90, 15)
     mover(20,20)
-    time.sleep(0.7)
+    time.sleep(0.8)
     guinada2('D', 45, 15)
     
 
@@ -1052,6 +1210,13 @@ def acionar_saida():
     TEMPO_IGNORAR_CANTO = 1.5
     ignorar_canto_ate = time.time() + TEMPO_IGNORAR_CANTO
 
+    # Exige ver o contorno (vertical=entrada ou horizontal=saida) em
+    # varios frames seguidos antes de agir - um frame so podia ser ruido/
+    # sombra passageira disparando o caso errado.
+    FRAMES_CONFIRMACAO_LINHA = 7  #3 - fita prata as vezes reflete luz e engana por alguns frames, subiu a margem
+    frames_vertical_seguidos = 0
+    frames_horizontal_seguidos = 0
+
     try:
         while True:
             checar_parada()
@@ -1066,6 +1231,7 @@ def acionar_saida():
                     cor_achada = info["cor"] if info else "?"
                     print(f"[SAIDA] Canto {cor_achada} detectado na camera de resgate")
                     print("vi um tringulozao verde ou vermelho")
+
                     mover(25, 25)
                     time.sleep(2.0)
                     mover(-20, -20)
@@ -1073,44 +1239,47 @@ def acionar_saida():
                     guinada2('D', 90, 15)
                     mover(15,15)
                     time.sleep(2.5)
-                    guinada2('D', 42, 15)
+                    guinada2('D', 43, 15)
                     ignorar_canto_ate = time.time() + TEMPO_IGNORAR_CANTO
 
             if cam_linha is not None:
                 ret_l, frame_l = cam_linha.read()
-                if ret_l and detectar_linha_embaixo(frame_l):
+
+                vertical_visto = ret_l and detectar_linha_vertical_embaixo(frame_l)
+                horizontal_visto = ret_l and not vertical_visto and detectar_linha_horizontal_embaixo(frame_l)
+                frames_vertical_seguidos = frames_vertical_seguidos + 1 if vertical_visto else 0
+                frames_horizontal_seguidos = frames_horizontal_seguidos + 1 if horizontal_visto else 0
+
+                if frames_vertical_seguidos >= FRAMES_CONFIRMACAO_LINHA:
+                    frames_vertical_seguidos = 0
+                    # Contorno VERTICAL = entrada da area de resgate (o robo ja
+                    # veio de la) - nao e a saida, so recua, vira pra direita e
+                    # continua o movimento continuo de busca.
                     parar_motores()
-                    print("[SAIDA] Linha preta detectada na camera de baixo")
-                    print("[SAIDA] Alinhando na linha...")
-                    # Gira pra esquerda pra passar da linha de proposito, depois
-                    # varre devagar de volta pra direita ate ver o contorno de
-                    # novo - assim o robo para alinhado EM CIMA da linha, nao
-                    # so na primeira leitura (que pode ter pego ela de lado/
-                    # angulo ruim, achando por acaso e nao alinhado de verdade).
+                    print("[SAIDA] Linha vertical (entrada) detectada, recuando e virando...")
+                    mover(-20, -20)
+                    time.sleep(0.6)
+                    guinada2('D', 90, 15)
                     mover(20, 20)
-                    time.sleep(0.2)
-                    guinada2('E', 20, 15)
-                    ALINHAR_VEL = 8
-                    ALINHAR_MAX_PASSOS = 60
-                    for _ in range(ALINHAR_MAX_PASSOS):
-                        checar_parada()
-                        mover(ALINHAR_VEL, -ALINHAR_VEL)
-                        time.sleep(0.05)
-                        parar_motores()
-                        ret_l2, frame_l2 = cam_linha.read()
-                        if ret_l2 and detectar_linha_embaixo(frame_l2):
-                            print("[SAIDA] Contorno da linha encontrado de novo, alinhado")
-                            break
+                    time.sleep(1.1)
+
+                elif frames_horizontal_seguidos >= FRAMES_CONFIRMACAO_LINHA:
+                    frames_horizontal_seguidos = 0
                     parar_motores()
+                    print("[SAIDA] Linha horizontal (saida) detectada na camera de baixo")
+                    print("[SAIDA] Alinhando na linha...")
+                    alinhar_na_linha()
                     return "linha_preta"
 
             if sonar_valido() and distancia_frente() < 10:
                 parar_motores()
                 time.sleep(0.2)
+                achou_canto = False
                 if ret_r and time.time() >= ignorar_canto_ate:
                     crop = center_crop(frame_r, CROP_W, CROP_H)
                     cx, area, info = detectar_entrega(crop)
                     if cx is not None:
+                        achou_canto = True
                         parar_motores()
                         cor_achada = info["cor"] if info else "?"
                         print(f"[SAIDA] Canto {cor_achada} detectado na camera de resgate")
@@ -1124,15 +1293,37 @@ def acionar_saida():
                         time.sleep(2.4)
                         guinada2('D', 43, 15)
                         ignorar_canto_ate = time.time() + TEMPO_IGNORAR_CANTO
-                else:        
-                    print("vi uma paredona")
-                    print(distancia_frente())
-                    parar_motores()
-                    mover(-14, -14)
-                    time.sleep(0.2)
-                    guinada2('D', 90, 15)
-                    time.sleep(0.3)
-                    aguardar_leitura_fresca_sonar()
+
+                # So chega aqui se NAO achou canto (seja porque o cooldown
+                # ainda estava valendo, seja porque olhou e nao tinha nada)
+                # - antes isso ficava sem cair em lugar nenhum quando o
+                # cooldown ja tinha passado mas cx dava None, e o robo
+                # ficava parado pra sempre vendo a mesma parede sem fazer
+                # a manobra de desviar.
+                if not achou_canto:
+                    if sonar_valido() and distancia_esquerda() > DIST_LATERAL_ABERTA_CM:
+                        print(distancia_esquerda())
+                        parar_motores()
+                        print("[SAIDA] Ultrassonico lateral aberto, confirmando com a camera de baixo...")
+                        guinada2('E', 90, 15)
+                        if confirmar_saida_lateral():
+                            print("[SAIDA] Contorno preto confirmado na abertura lateral, alinhando...")
+                            alinhar_na_linha()
+                            return "sonar_lateral"
+                        else:
+                            print("[SAIDA] Nao viu contorno na abertura lateral - falso positivo do sonar")
+                            mover(-15, -15)
+                            time.sleep(0.8)
+                            guinada2("D", 90, 20)
+                    else:
+                        print("vi uma paredona")
+                        print(distancia_frente())
+                        parar_motores()
+                        mover(-14, -14)
+                        time.sleep(0.2)
+                        guinada2('D', 90, 15)
+                        time.sleep(0.3)
+                        aguardar_leitura_fresca_sonar()
 
             # Antes de confiar no lateral pra decidir "corredor aberto", garante
             # que a leitura e de DEPOIS de qualquer giro/movimentacao desse loop
@@ -1142,14 +1333,60 @@ def acionar_saida():
             if sonar_valido() and distancia_esquerda() > DIST_LATERAL_ABERTA_CM:
                 print(distancia_esquerda())
                 parar_motores()
-                print("[SAIDA] Ultrassonico lateral aberto")
-                print()
-                return "sonar_lateral"
+                print("[SAIDA] Ultrassonico lateral aberto, confirmando com a camera de baixo...")
+                mover(20, 20)
+                time.sleep(0.3)
+                guinada2('E', 90, 15)
+                if confirmar_saida_lateral():
+                    print("[SAIDA] Contorno preto confirmado na abertura lateral, alinhando...")
+                    alinhar_na_linha()
+                    return "sonar_lateral"
+                else:
+                    print("[SAIDA] Nao viu contorno na abertura lateral - falso positivo do sonar")
+                    mover(-15, -15)
+                    time.sleep(0.8)
+                    guinada2('D', 90, 15)
 
             time.sleep(0.02)
     finally:
         parar_motores()
         ALVO_COR = None
+
+
+def _salvar_calibracao(valores):
+    """Escreve valores calibrados ao vivo direto nas constantes no topo
+    deste proprio arquivo - troca so o numero/array de cada linha, guarda
+    o valor anterior num comentario novo pra nao perder o historico.
+    `valores` e um dict {NOME_DA_CONSTANTE: novo_valor}; novo_valor pode
+    ser numero ou np.array (vira "np.array([...])" no arquivo)."""
+    caminho = os.path.abspath(__file__)
+    try:
+        with open(caminho, "r", encoding="utf-8") as f:
+            conteudo = f.read()
+    except Exception as e:
+        print(f"[CALIBRA][ERRO] Falha ao ler {caminho} pra salvar: {e}")
+        return
+
+    for nome, novo_valor in valores.items():
+        if isinstance(novo_valor, np.ndarray):
+            valor_str = f"np.array([{', '.join(str(int(v)) for v in novo_valor)}])"
+        else:
+            valor_str = str(novo_valor)
+        padrao = re.compile(rf"^{nome}\s*=\s*([^\n#]+?)\s*(#.*)?$", re.MULTILINE)
+        m = padrao.search(conteudo)
+        if not m:
+            print(f"[CALIBRA][ERRO] Nao achei a linha de {nome} pra salvar")
+            continue
+        valor_antigo = m.group(1).strip()
+        nova_linha = f"{nome} = {valor_str}  # calibrado ao vivo, era {valor_antigo}"
+        conteudo = padrao.sub(lambda _m, nl=nova_linha: nl, conteudo, count=1)
+
+    try:
+        with open(caminho, "w", encoding="utf-8") as f:
+            f.write(conteudo)
+        print(f"[CALIBRA] Valores salvos direto no resgate.py: {list(valores.keys())}")
+    except Exception as e:
+        print(f"[CALIBRA][ERRO] Falha ao gravar {caminho}: {e}")
 
 
 def _mascara_cor_tri(hsv, cor):
@@ -1173,7 +1410,7 @@ def _eh_triangulo(contorno, encostando_borda=False):
         return False, None
 
     perimetro = cv2.arcLength(contorno, True)
-    aproximado = cv2.approxPolyDP(contorno, 0.10 * perimetro, True)
+    aproximado = cv2.approxPolyDP(contorno, 0.06 * perimetro, True)  #0.10 - epsilon grande demais suavizava blob de ruido (6 vertices reais) ate parecer quadrilatero valido (4)
 
     print("Vertices internos:", len(aproximado))
 
@@ -1214,8 +1451,8 @@ def detectar_entrega(crop):
     Procura triângulos (cantos de parede) no crop. Se ALVO_COR estiver
     definido, só aceita essa cor; senão aceita verde ou vermelho e
     devolve o de MAIOR área (mais perto). Retorna (cx, area, info) ou
-    (None, None, None). Sempre mostra as janelas de debug (normal +
-    máscara verde + máscara vermelho).
+    (None, None, None). Com DEBUG_VISUAL=True, mostra as janelas de debug
+    (crop + deteccoes, máscara verde, máscara vermelho).
     """
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     cores = [ALVO_COR] if ALVO_COR else ["verde", "vermelho"]
@@ -1254,6 +1491,19 @@ def detectar_entrega(crop):
             if ok:
                 info["cor"] = cor
                 todas_deteccoes.append(info)
+
+    if DEBUG_VISUAL:
+        debug_img = crop.copy()
+        for d in todas_deteccoes:
+            cor_bgr = (0, 255, 0) if d["cor"] == "verde" else (0, 0, 255)
+            cv2.drawContours(debug_img, [d["vertices"]], -1, cor_bgr, 2)
+            cv2.circle(debug_img, d["centro"], 4, (0, 255, 255), -1)
+        cv2.imshow("TRI - crop + deteccoes", debug_img)
+        if mask_verde is not None:
+            cv2.imshow("TRI - mask verde", mask_verde)
+        if mask_vermelho is not None:
+            cv2.imshow("TRI - mask vermelho", mask_vermelho)
+        cv2.waitKey(1)
 
     if not todas_deteccoes:
         return None, None, None
@@ -1330,10 +1580,16 @@ def aproximar_triangulo():
         cx, area, info = detectar_entrega(crop)
 
         if cx is None:
+            # Para na hora que perde de vista, mesmo antes de desistir de
+            # vez (TRIANGULO_LOST_FRAMES) - sem isso o robo continuava
+            # avancando cego pela inercia do ultimo forward() enquanto
+            # tentava reencontrar o triangulo. So mexe nesse caso; o
+            # avanco normal (triangulo visto, seguindo) continua continuo,
+            # sem parar entre passos.
+            parar_motores()
             perdida += 1
             print(f"Triângulo sumiu durante aproximação ({perdida}/{TRIANGULO_LOST_FRAMES})")
             if perdida >= TRIANGULO_LOST_FRAMES:
-                parar_motores()
                 return False
             time.sleep(APPROACH_STEP_TIME)
             continue
@@ -1362,6 +1618,30 @@ def aproximar_triangulo():
     parar_motores()
     return False
 
+def reposicionar_canto(tentativa, vel_recuo=20):
+    """
+    Reposiciona pra tentar achar/centralizar/aproximar do canto de novo.
+    Nas 2 primeiras tentativas seguidas, recua e vira um pouco (o de
+    sempre). Se persistir depois disso (3a tentativa em diante), recuar
+    de novo nao esta ajudando - troca pra ir pra frente, cada vez mais
+    pra frente, em vez de ficar so recuando sem sair do lugar.
+    """
+    if tentativa <= 2:
+        mover(-vel_recuo, -vel_recuo)
+        time.sleep(0.4)
+        mover(-30, 0)
+        time.sleep(0.3)
+        parar_motores()
+    else:
+        mover(15, 15)
+        time.sleep(0.4)
+        parar_motores()
+        time.sleep(0.1)
+        mover(22, 22)
+        time.sleep(0.7)
+        parar_motores()
+
+
 def buscar_triangulo():
     """Gira no lugar até achar um triângulo. Retorna True se achou."""
     print(f"🔎 [buscar_triangulo] ALVO_COR ativo = {ALVO_COR!r}")
@@ -1371,6 +1651,11 @@ def buscar_triangulo():
         if crop is not None:
             cx, area, info = detectar_entrega(crop)
             if cx is not None:
+                # DEBUG: pra flagrar triangulo "do nada" (falso positivo)
+                # quando aparecer.
+                cor_dbg = info["cor"] if info else "?"
+                area_dbg = info["area"] if info else area
+                print(f"[BUSCAR_TRIANGULO] Detectado cor={cor_dbg} area={area_dbg} cx={cx}")
                 return True
         turn_right(speed=15)
         '''time.sleep(TURN_PULSE)
@@ -1403,30 +1688,25 @@ def entregar_bola(cor_alvo=None):
     else:
         print("Procurando área de entrega (qualquer cor)...")
 
+    tentativas_reposicionar = 0
     while True:
 
         if not buscar_triangulo():
             print("Não encontrou triângulo, reposicionando...")
-            mover(-25, -25)
-            time.sleep(0.4)
-            mover(-30,0)
-            time.sleep(0.2)
+            tentativas_reposicionar += 1
+            reposicionar_canto(tentativas_reposicionar, vel_recuo=25)
             continue
 
         if not centralizar_triangulo():
             print("Não conseguiu centralizar, reposicionando...")
-            mover(-25, -25)
-            time.sleep(0.4)
-            mover(-30,0)
-            time.sleep(0.2)
+            tentativas_reposicionar += 1
+            reposicionar_canto(tentativas_reposicionar, vel_recuo=25)
             continue
 
         if not aproximar_triangulo():
             print("Não conseguiu aproximar, reposicionando...")
-            mover(-25, -25)
-            time.sleep(0.4)
-            mover(-30,0)
-            time.sleep(0.2)
+            tentativas_reposicionar += 1
+            reposicionar_canto(tentativas_reposicionar, vel_recuo=25)
             continue
 
         # conseguiu chegar no triângulo
@@ -1446,7 +1726,7 @@ def entregar_bola(cor_alvo=None):
     time.sleep(1.5)
     parar_motores()          # <-- adiciona os parênteses
     angulo(170)
-    mover_servo(PINO_PESADO, 20, velocidade=20)
+    mover_servo(PINO_PESADO, 20, velocidade=60)
     oscilar_servo_lgpio(PINO_PESADO, 30, 60,13,0.2)
    
     mover_servo(PINO_PESADO, 150, velocidade=50)
@@ -1454,7 +1734,7 @@ def entregar_bola(cor_alvo=None):
     mover_servo(PINO_PESADO, 140, velocidade=50)
     time.sleep(1.0)
     mover(-30,-30)
-    time.sleep(1.0)
+    time.sleep(1.25)
     parar_motores()          # <-- adiciona essa também, no final da ré
     #parar_servo(PINO_PESADO)
     #parar_servo(PINO_SG90)
@@ -1498,13 +1778,19 @@ def angulo(ang):
     lgpio.tx_servo(h, PINO_SG90, 0)
     time.sleep(0.09)
 
-def mover_servo_direto(pino, angulo, pulso_min=500, pulso_max=2500):
+def mover_servo_direto(pino, angulo, pulso_min=500, pulso_max=2500, manter_pulso=False):
+    """manter_pulso=True deixa o PWM ligado depois do movimento, em vez de
+    cortar - sem isso, um servo sob carga (peso puxando, tipo o servo
+    pesado) perde a forca de segurar posicao assim que o pulso e cortado
+    e continua deslizando na direcao da carga em vez de ficar parado no
+    angulo pedido."""
     angulo = max(0, min(180, angulo))
     largura_pulso = pulso_min + (angulo / 180.0) * (pulso_max - pulso_min)
     lgpio.tx_servo(h, pino, int(largura_pulso))
     time.sleep(0.15)
-    parar_servo(pino)
-    _angulo_atual[pino] = angulo 
+    if not manter_pulso:
+        parar_servo(pino)
+    _angulo_atual[pino] = angulo
 
 
 
@@ -1545,7 +1831,9 @@ def centralizar_bola():
             perdida += 1
             if perdida >= CENTER_LOST_FRAMES:
                 print("Perdeu a bola durante centralização")
-                parar_motores()
+                mover(-20, -20)
+                time.sleep(0.15)
+                guinada2('E', 5, 15)
                 return False
             continue
 
@@ -1573,6 +1861,9 @@ def centralizar_bola():
         time.sleep(0.05)  # deixa a vibração assentar antes de recapturar
 
     print("Estourou tentativas de centralização")
+    mover(20, 20)
+    time.sleep(0.15)
+    guinada2('E', 5, 15)
     parar_motores()
     return False
 
@@ -1581,7 +1872,8 @@ def detectar_bola(crop):
     Roda o modelo num crop e devolve (cx, area, bbox, cls_id) ou
     (None, None, None, None). cls_id é o índice da classe detectada
     (ex.: bola preta ou bola prata), usado depois pra saber em qual
-    área de entrega (cor) soltar a bola.
+    área de entrega (cor) soltar a bola. Com DEBUG_VISUAL=True, mostra
+    o crop com o bbox/classe desenhado (janela de "deteccao de vitima").
     """
     results = model.predict(
         crop, imgsz=(320, 256), conf=CONF_THRES, verbose=False, show=False
@@ -1595,7 +1887,20 @@ def detectar_bola(crop):
         cx = (x1 + x2) // 2
         area = (x2 - x1) * (y2 - y1)
         cls_id = int(boxes.cls[idx].item()) if getattr(boxes, "cls", None) is not None else None
+
+        if DEBUG_VISUAL:
+            debug_img = crop.copy()
+            cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            nome_classe = model.names.get(cls_id, str(cls_id)) if cls_id is not None else "?"
+            cv2.putText(debug_img, nome_classe, (x1, max(y1 - 5, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.imshow("VITIMA (bola) - deteccao", debug_img)
+            cv2.waitKey(1)
+
         return cx, area, (x1, y1, x2, y2), cls_id
+
+    if DEBUG_VISUAL:
+        cv2.imshow("VITIMA (bola) - deteccao", crop)
+        cv2.waitKey(1)
 
     return None, None, None, None
 
@@ -1637,9 +1942,26 @@ def aproximar_bola():
         print(f"passo={passo} area_ratio={ratio:.2f} cx={cx}")
 
         if ratio >= STOP_AREA_RATIO:
-            print("Perto o suficiente pra garra, parando")
+            # area_ratio varia bastante de frame pra frame (movimento,
+            # bbox tremendo) - confirma com uma segunda leitura antes de
+            # aceitar, pra nao parar cedo/tarde demais por causa de um
+            # pico isolado.
+            print(f"[APROXIMAR] area_ratio={ratio:.2f} bateu o limiar, confirmando de novo...")
             parar_motores()
-            return True
+            time.sleep(0.1)
+            crop_confirma = capturar_crop()
+            ratio_confirma = None
+            if crop_confirma is not None:
+                cx_confirma, area_confirma, _, _ = detectar_bola(crop_confirma)
+                if cx_confirma is not None:
+                    ratio_confirma = area_confirma / crop_area
+
+            if ratio_confirma is not None and ratio_confirma >= STOP_AREA_RATIO:
+                print(f"[APROXIMAR] Confirmado (area_ratio={ratio_confirma:.2f}), perto o suficiente pra garra")
+                return True
+
+            print(f"[APROXIMAR] Nao confirmou (area_ratio={ratio_confirma}), continuando aproximacao")
+            continue
 
         # se saiu do centro, delega a correção pro centralizar_bola
         if abs(cx - IMG_CENTER_X) > TOLERANCE:
@@ -1705,21 +2027,9 @@ def verificar_e_afastar_bola_bloqueio():
 
 
 def afastar_bola_do_canto():
-    '''checar_parada()
-    mover(-30, -30)
-    time.sleep(0.5)
-    mover_servo(PINO_PESADO, 5, velocidade=10)
-    mover(30, 30)
-    time.sleep(0.6)
-    mover(-30, 30)
-    time.sleep(0.2)
-    mover(30, -30)
-    time.sleep(0.4)
-    mover(-30, 30)
-    time.sleep(0.4)
-    mover(30, -30)
-    time.sleep(0.2)'''
-    pass    
+    checar_parada()
+    guinada2('E', 175, 25)
+    guinada2('E', 160, 25)
 
 # ===================== SETUP CÂMERA E MODELO =====================
 cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
@@ -1731,30 +2041,139 @@ if not cap.isOpened():
     exit(1)
 
 # Camera de baixo (chao) - so usada dentro de acionar_saida() pra ver a
-# linha preta. Se nao abrir, acionar_saida() simplesmente ignora esse
-# criterio e segue com triangulo/ultrassonico.
+# linha preta.
 cap_linha = None  # só é aberta dentro de acionar_saida()
 
+USBDEVFS_RESET = 21780  # 0x5514 -> _IO('U', 20), constante do kernel Linux
+USB_RESET_TENTATIVAS_ANTES_DE_RESETAR = 3  # falhas seguidas antes de tentar resetar USB
+
+
+def _achar_bus_dev(video_path):
+    nome = os.path.basename(os.path.realpath(video_path))
+    sys_dev = f"/sys/class/video4linux/{nome}/device"
+    d = os.path.realpath(sys_dev)
+    for _ in range(8):
+        busnum_f = os.path.join(d, "busnum")
+        devnum_f = os.path.join(d, "devnum")
+        if os.path.exists(busnum_f) and os.path.exists(devnum_f):
+            with open(busnum_f) as f:
+                busnum = int(f.read().strip())
+            with open(devnum_f) as f:
+                devnum = int(f.read().strip())
+            return busnum, devnum
+        novo_d = os.path.dirname(d)
+        if novo_d == d:
+            break
+        d = novo_d
+    return None, None
+
+
+def resetar_usb_camera_linha(video_path_ou_indice):
+    if isinstance(video_path_ou_indice, int):
+        video_path = f"/dev/video{video_path_ou_indice}"
+    else:
+        video_path = video_path_ou_indice
+
+    ok = False
+    try:
+        busnum, devnum = _achar_bus_dev(video_path)
+        if busnum is not None:
+            usb_node = f"/dev/bus/usb/{busnum:03d}/{devnum:03d}"
+            fd = os.open(usb_node, os.O_WRONLY)
+            try:
+                fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+                print(f"[USB] Reset via ioctl OK em {usb_node} (camera {video_path})")
+                ok = True
+            finally:
+                os.close(fd)
+        else:
+            print(f"[USB][AVISO] Nao achei bus/dev USB pra {video_path}")
+    except PermissionError:
+        print("[USB][ERRO] Sem permissao pra resetar USB (roda como root ou "
+              "cria regra de udev liberando /dev/bus/usb/*)")
+    except Exception as e:
+        print("[USB][ERRO] Falha no reset via ioctl:", e)
+
+    try:
+        subprocess.run(["uhubctl"], capture_output=True, timeout=2)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    time.sleep(1.0)
+    return ok
+
+
+def _abrir_camera_linha_generica(fonte):
+    """Igual config.py: so aceita a camera depois de ler um frame de
+    verdade (isOpened() sozinho nao garante que a camera funciona)."""
+    cap_local = cv2.VideoCapture(fonte, cv2.CAP_V4L2)
+    if cap_local.isOpened():
+        ret, _ = cap_local.read()
+        if ret:
+            return cap_local
+        cap_local.release()
+    return None
+
+
+def _detectar_camera_linha():
+    # checar_parada() a cada tentativa, nao so entre uma varredura completa
+    # e outra - uma varredura sozinha (by-id + fallback + 10 indices, cada
+    # um podendo dar timeout do V4L2) pode passar dos 4s que o
+    # watchdog_seguranca() tolera sem heartbeat, disparando parada forcada
+    # dos motores no meio de uma busca de camera que ainda nem falhou de
+    # vez.
+    if CAMERA_INDEX_LINHA:
+        checar_parada()
+        c = _abrir_camera_linha_generica(CAMERA_INDEX_LINHA)
+        if c is not None:
+            print(f"[Camera] Linha conectada em {CAMERA_INDEX_LINHA}")
+            return c
+
+    checar_parada()
+    c = _abrir_camera_linha_generica(CAMERA_LINHA_INDEX_FALLBACK)
+    if c is not None:
+        print(f"[Camera] Linha conectada no indice {CAMERA_LINHA_INDEX_FALLBACK}")
+        return c
+
+    for i in range(10):
+        checar_parada()
+        c = _abrir_camera_linha_generica(i)
+        if c is not None:
+            print(f"[Camera] Linha conectada em /dev/video{i}")
+            return c
+    return None
+
+
 def abrir_camera_linha():
+    """Mesma logica de LINE_FOLLOWER/config.py:iniciar_camera() - by-id
+    primeiro (verificado por leitura de frame de verdade, nao so
+    isOpened()), fallback por indice, varredura final, e fica tentando de
+    novo (com reset de USB a cada poucas falhas) em vez de desistir na
+    primeira tentativa. Era por causa da falta disso que a camera de
+    baixo falhava direto na saida mas abria normal segundos depois no
+    seguidor (que ja usava essa logica robusta)."""
     global cap_linha
     if cap_linha is not None and cap_linha.isOpened():
         return cap_linha
 
-    cap_linha = cv2.VideoCapture(CAMERA_INDEX_LINHA, cv2.CAP_V4L2)
-    if not cap_linha.isOpened():
-        print(f"Não consegui abrir a câmera de baixo em {CAMERA_INDEX_LINHA}, tentando fallback...")
-        cap_linha.release()
-        cap_linha = cv2.VideoCapture(CAMERA_LINHA_INDEX_FALLBACK, cv2.CAP_V4L2)
+    tentativas = 0
+    cap_local = _detectar_camera_linha()
+    while cap_local is None:
+        tentativas += 1
+        print(f"[Camera] Linha (saida) ainda nao apareceu, tentando de novo... (tentativa {tentativas})")
+        checar_parada()
+        time.sleep(1)
+        if tentativas % USB_RESET_TENTATIVAS_ANTES_DE_RESETAR == 0:
+            print("[Camera] Varias falhas seguidas, tentando resetar USB...")
+            resetar_usb_camera_linha(CAMERA_INDEX_LINHA or CAMERA_LINHA_INDEX_FALLBACK)
+        cap_local = _detectar_camera_linha()
 
-    if cap_linha.isOpened():
-        cap_linha.set(cv2.CAP_PROP_FRAME_WIDTH, LINHA_W)
-        cap_linha.set(cv2.CAP_PROP_FRAME_HEIGHT, LINHA_H)
-        cap_linha.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    else:
-        print("Câmera de baixo indisponível, acionar_saida() vai rodar sem detecção de linha")
-        cap_linha.release()
-        cap_linha = None
-
+    cap_local.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap_local.set(cv2.CAP_PROP_FRAME_WIDTH, LINHA_W)
+    cap_local.set(cv2.CAP_PROP_FRAME_HEIGHT, LINHA_H)
+    cap_linha = cap_local
     return cap_linha
 
 mover_servo(PINO_PESADO, 150, velocidade=100)
@@ -1786,7 +2205,7 @@ try:
     while True:
         try:
             checar_parada()
-            '''turn_right(speed=25)
+            turn_right(speed=25)
             time.sleep(TURN_PULSE)
 
             parar_motores()
@@ -1872,17 +2291,20 @@ try:
                 time.sleep(0.09)
                 parar_motores()
                 angulo(0)
-                mover_servo(PINO_PESADO, 30, velocidade=10)
-                mover(-15,-15)
-                time.sleep(0.1)
+                mover(15,15)
+                time.sleep(0.15)
                 parar_motores()
-                mover(17,17)
-                time.sleep(0.78)
+                '''mover_servo(PINO_PESADO, 32, velocidade=20)
+                mover(15,15)
+                time.sleep(0.6)
+                parar_motores()'''
+                '''mover(13,13)
+                time.sleep(1.4)
                 parar_motores()
                 mover(-1,-1)
                 time.sleep(0.09)
-                parar_motores()
-                mover_servo(PINO_PESADO, 0, velocidade=5)
+                parar_motores()'''
+                mover_servo(PINO_PESADO, 0, velocidade=60)
                 mover(20,20)
                 time.sleep(0.5)
                 parar_motores()
@@ -1898,7 +2320,7 @@ try:
                 mover(-1,-1)
                 time.sleep(0.09)
                 parar_motores()
-                mover_servo(PINO_PESADO, 150, velocidade=5)
+                mover_servo(PINO_PESADO, 150, velocidade=20)
                 mover(-25,-25)
                 time.sleep(0.5)
                 parar_motores()
@@ -1911,15 +2333,10 @@ try:
                 if entregas_realizadas >= MAX_ENTREGAS:
                     print(f"[BOOT] {entregas_realizadas} entregas ja feitas, fazendo busca final antes da saida...")
                     if buscar_bola():
-                        # Ainda tem bola na area - o limite de entregas nao
-                        # impede pegar e entregar ela tambem. Nao vai pra
-                        # saida: deixa o loop seguir, a proxima iteracao ja
-                        # detecta essa bola e faz a captura/entrega normal.
+                       
                         print("[BUSCA FINAL] Achou bola sobrando, indo pegar e entregar mesmo assim")
                     else:
-                        # SAIDA DESATIVADA (a pedido) - em vez de ir pra saida
-                        # quando bater o limite de entregas, o robo continua
-                        # buscando bolas. Nada foi apagado, so comentado.
+                        
                         print("[BUSCA FINAL] Nenhuma bola a mais na area, indo pra saida")
                         caso_saida = acionar_saida()
                         print(f"[SAIDA] Caso identificado: {caso_saida}")
@@ -1935,15 +2352,7 @@ try:
                     # deixa o loop seguir e a próxima iteração já detecta e pega essa bola
 
             else:
-                print(" Nenhuma bola — novo passo de giro")'''
-            caso_saida = acionar_saida()
-            print(f"[SAIDA] Caso identificado: {caso_saida}")
-            parar_motores()
-            cap.release()
-            if cap_linha is not None:
-                cap_linha.release()
-            GPIO.gpiochip_close(h)
-            os.execv(sys.executable, [sys.executable, "/home/pi/ROBO_DOGO_2026/codes_rasp/LINE_FOLLOWER/main.py", "--auto"])
+                print(" Nenhuma bola — novo passo de giro")
         except RoboParado:
             print("Robo parado pelo botao,voltando pro seguidor...")
             parar_motores()
@@ -1957,11 +2366,7 @@ try:
                 f"--entregas={entregas_realizadas}",
             ])
         except Exception as e:
-            # Qualquer erro inesperado (ex: lgpio.error por chip GPIO
-            # sobrecarregado) - antes so RoboParado era tratado aqui, entao
-            # qualquer outra excecao derrubava o processo inteiro sem
-            # garantir que os motores pararam. Tenta parar e continua
-            # tentando o resgate em vez de morrer travado.
+            
             print(f"[ERRO CRITICO] Excecao inesperada no loop de resgate: {e!r}")
             try:
                 parar_motores()
