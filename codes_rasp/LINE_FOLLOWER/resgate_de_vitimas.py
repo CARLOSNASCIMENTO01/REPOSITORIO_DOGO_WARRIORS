@@ -15,7 +15,7 @@ import time
 import cv2
 
 import config
-
+import movimentos_bases
 # "from ultralytics import YOLO" NAO fica aqui no topo - sozinho ja custa
 # varios segundos (importa o torch inteiro) e travava o boot do seguidor
 # antes de qualquer print, mesmo o modelo de vitima nunca sendo usado nessa
@@ -156,6 +156,6 @@ def area(contours):
     print("estou na area")
     os.execv(sys.executable, [
         sys.executable,
-        "/home/pi/ROBO_DOGO_2026/codes_rasp/PROTOTIPAGEM_LINE/resgate.py",
+        "/home/pi/ROBO_DOGO_2026/codes_rasp/LINE_FOLLOWER/resgate.py",
         f"--entregas={config.ENTREGAS_HERDADAS}",
     ])

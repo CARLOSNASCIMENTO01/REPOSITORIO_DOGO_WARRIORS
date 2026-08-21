@@ -111,8 +111,8 @@ def limpar_camera(n=5):
 # CONTROLE (segue linha) - PID
 # =========================================================================
 Kp = 0.9 #0.9
-Kd = 0.25 # 0.3
-VEL_BASE = 18 #15
+Kd = 0.27 # 0.27
+VEL_BASE =20 #20
 DEADZONE = 0 # 8, 0
 
 contador_gangorra = 0

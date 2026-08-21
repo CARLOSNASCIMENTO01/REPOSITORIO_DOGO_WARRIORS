@@ -1120,7 +1120,7 @@ def area(contours):
     print("estou na area")
     os.execv(sys.executable, [
         sys.executable,
-        "/home/pi/ROBO_DOGO_2026/codes_rasp/PROTOTIPAGEM_LINE/resgate.py",
+        "/home/pi/ROBO_DOGO_2026/codes_rasp/LINE_FOLLOWER/resgate.py",
         f"--entregas={ENTREGAS_HERDADAS}",
     ])
 

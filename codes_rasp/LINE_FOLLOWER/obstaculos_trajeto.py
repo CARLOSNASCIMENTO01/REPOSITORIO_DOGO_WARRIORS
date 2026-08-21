@@ -56,7 +56,7 @@ def desvio():
             time.sleep(1.4)
             config.mover(-2, 2)
             time.sleep(0.1)"""
-            movimentos_bases.guinada2("D", 92, 14)
+            movimentos_bases.guinada2("D", 96, 14)
             time.sleep(0.2)
 
             while True:
@@ -142,7 +142,7 @@ def desvio():
             time.sleep(0.1)"""
             movimentos_bases.guinada2("D", 90, 18)
             config.mover(-13, -13)
-            time.sleep(0.7)
+            time.sleep(0.9)
             config.mover(2, 2)
             time.sleep(0.9)
             config.mover(0, 0)

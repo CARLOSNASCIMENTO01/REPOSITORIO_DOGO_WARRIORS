@@ -89,7 +89,7 @@ ESCALA_PWM_YAHBOOM = 70  # converte a faixa antiga do L298N (-50..50) pra PWM Ya
 PWM_FREIO_YAHBOOM = 700   # forca do pulso de freio reverso ao parar
 TEMPO_FREIO_YAHBOOM = 0.08  # segundos do pulso de freio
 
-VEL_MAX = 22#20
+VEL_MAX = 22#22
 VEL_MIN = -VEL_MAX
 
 ANGULO_INICIAL = 90
@@ -98,6 +98,7 @@ ANGULO_INICIAL = 90
 # enquanto o robo esta ativo, abaixado (0) enquanto parado/esperando o botao.
 SERVO_PESADO_ANGULO_ATIVO = 140
 SERVO_PESADO_ANGULO_PARADO = 90
+TEMPO_ASSENTAMENTO_SERVO_DIRETO = 0.4  # tempo pra segurar o pulso ate o servo assentar antes de cortar o PWM
 
 def _detectar_porta_yahboom(sair_se_falhar=True):
     """Acha a porta serial da placa Yahboom pelo VID:PID (1a86:7522, CH340
@@ -268,6 +269,18 @@ def mover_servo_direto(pino, angulo_alvo, pulso_min=500, pulso_max=2500):
     largura_pulso = pulso_min + (angulo_alvo / 180.0) * (pulso_max - pulso_min)
     lgpio.tx_servo(h, pino, int(largura_pulso))
     mover_servo._angulo_atual[pino] = angulo_alvo
+
+    # mover_servo() sempre corta o PWM depois de assentar (evita o servo
+    # "brigando" com o sinal o resto da execucao) - essa versao "direta"
+    # deixava o pulso ligado pra sempre depois da chamada, e era isso que
+    # fazia o servo pesado tremer continuamente enquanto o processo rodava
+    # (o tremor sumia so quando o processo morria e o PWM parava de ser
+    # gerado). Segura o pulso so o tempo de assentar e corta, igual mover_servo().
+    time.sleep(TEMPO_ASSENTAMENTO_SERVO_DIRETO)
+    try:
+        lgpio.tx_servo(h, pino, 0)
+    except lgpio.error as e:
+        print(f"Falha ao desligar PWM do servo (pino={pino}): {e}")
 
 
 def sensor_e():
