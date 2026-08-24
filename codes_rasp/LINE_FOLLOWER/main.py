@@ -78,16 +78,8 @@ def loop_principal():
         if not ret:
             falhas_camera_seguidas += 1
             if falhas_camera_seguidas >= FALHAS_CAMERA_ANTES_DE_RESETAR:
-                print("[Camera] Linha de camera parou de responder, resetando USB...")
-                try:
-                    config.cap.release()
-                except Exception:
-                    pass
-                config.resetar_usb_camera(
-                    config.CAMERA_LINHA_PATH or config.CAMERA_LINHA_INDEX_FALLBACK
-                )
-                config.iniciar_camera()
-                falhas_camera_seguidas = 0
+                print("[Camera] Linha de camera parou de responder, reiniciando processo...")
+                config.reiniciar_processo()
             continue
         falhas_camera_seguidas = 0
 
@@ -216,6 +208,12 @@ if __name__ == "__main__":
             except OSError as e:
                 print("[MPU] Erro I2C:", repr(e))
                 time.sleep(0.01)
+                continue
+
+            except config.RoboParado:
+                # Botao pausou o robo - nao e erro. So espera aqui
+                # (robo_ativo.wait() la em cima) ate apertar de novo, e
+                # loop_principal() recomeca do zero quando retomar.
                 continue
 
             except Exception as e:

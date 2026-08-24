@@ -162,6 +162,7 @@ def _enviar_pwm_yahboom(m1, m2, m3, m4):
         motor_serial.write(f"$pwm:{m1},{m2},{m3},{m4}#".encode())
     except serial.SerialException as e:
         print(f"[MOTOR][ERRO] Falha ao mandar PWM pra placa Yahboom: {e}")
+        reiniciar_processo()
 
 
 _ultima_vel = (0, 0)  # (velL, velR) do ultimo mover(), pra parar() saber pra que lado frear
@@ -288,66 +289,61 @@ def sensor_e():
 
 
 def reiniciar_processo():
-    """Reinicia o processo do zero via os.execv - equivalente a apertar
-    Ctrl+C no terminal e rodar `python3 main.py` de novo. Um resume "por
-    dentro" (so robo_ativo.set()) carrega estado velho de threads/sensores
-    (referencia de travamento, offset do giro, buffer da camera, etc.);
-    reiniciar o processo garante que tudo comeca limpo, sem herdar nada
-    disso. Igual ao resto do codigo que usa execv (main.py <-> resgate.py),
-    limpa motor/camera/GPIO antes de trocar a imagem do processo."""
-    print("[BOTAO] Reiniciando processo do zero...")
+    """Reinicia o processo do zero via os.execv - usado quando a placa
+    Yahboom (motor) ou uma camera perdem conexao em tempo de execucao.
+    Resume "por dentro" deixaria estado velho de threads/sensores (buffer
+    de camera travado, serial do motor morta); reiniciar o processo forca
+    tudo a abrir de novo do zero, e o boot (_aguardar_porta_yahboom(),
+    iniciar_camera()) ja fica tentando reconectar sozinho ate conseguir."""
+    print("[RECONEXAO] Falha de conexao (motor/camera) - reiniciando processo do zero...")
     try:
         parar()
     except Exception as e:
-        print(f"[BOTAO][ERRO] Falha ao parar motores antes de reiniciar: {e}")
-    try:
-        mover_servo_direto(PINO_PESADO, SERVO_PESADO_ANGULO_PARADO)
-    except Exception as e:
-        print(f"[BOTAO][ERRO] Falha ao abaixar servo antes de reiniciar: {e}")
+        print(f"[RECONEXAO][ERRO] Falha ao parar motores antes de reiniciar: {e}")
     try:
         if cap is not None:
             cap.release()
     except Exception as e:
-        print(f"[BOTAO][ERRO] Falha ao liberar camera antes de reiniciar: {e}")
+        print(f"[RECONEXAO][ERRO] Falha ao liberar camera antes de reiniciar: {e}")
     try:
         if ser is not None:
             ser.close()
     except Exception as e:
-        print(f"[BOTAO][ERRO] Falha ao fechar serial do sonar antes de reiniciar: {e}")
+        print(f"[RECONEXAO][ERRO] Falha ao fechar serial do sonar antes de reiniciar: {e}")
     try:
         if motor_serial is not None:
             motor_serial.close()
     except Exception as e:
-        print(f"[BOTAO][ERRO] Falha ao fechar serial do motor antes de reiniciar: {e}")
+        print(f"[RECONEXAO][ERRO] Falha ao fechar serial do motor antes de reiniciar: {e}")
     try:
         lgpio.gpiochip_close(h)
     except Exception as e:
-        print(f"[BOTAO][ERRO] Falha ao fechar GPIO antes de reiniciar: {e}")
+        print(f"[RECONEXAO][ERRO] Falha ao fechar GPIO antes de reiniciar: {e}")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def botao_thread():
+    """Toggle rapido: aperta -> pausa o robo na hora (RoboParado interrompe
+    qualquer guinada/desvio/resgate em andamento, ver checar_parada()).
+    Aperta de novo -> retoma, e loop_principal() recomeca do jeito que
+    sempre comeca (reseta erro do PID, giroscopio, motores) antes de voltar
+    a procurar a linha - sem reiniciar o processo inteiro (sem os.execv),
+    entao volta na hora, sem o delay de boot (camera/serial/BNO055) de novo.
+    Falha de verdade (excecao que nao seja RoboParado, tipo camera/serial
+    caindo) nao passa por aqui - quem lida com isso e o except Exception
+    generico no loop de main.py, que tenta de novo sozinho."""
     anterior = 0
-    # --auto ja comeca com robo_ativo ligado (vindo do resgate) - nesse caso
-    # a "primeira ativacao" ja aconteceu antes dessa thread nem existir.
-    ja_foi_ativado = robo_ativo.is_set()
     while True:
         estado = lgpio.gpio_read(h, BUTTON)
         if estado == 1 and anterior == 0:
             time.sleep(0.03)
             if lgpio.gpio_read(h, BUTTON) == 1:
-                # Espera soltar ANTES de agir. reiniciar_processo() faz
-                # execv e nao volta mais pra essa thread - se agisse com o
-                # dedo ainda no botao, o processo novo nasceria com
-                # anterior=0 e leria esse MESMO nivel alto como um toque
-                # novo, reiniciando em loop enquanto o botao nao fosse
-                # solto de verdade. Por isso o release tem que vir antes.
                 while lgpio.gpio_read(h, BUTTON) == 1:
                     time.sleep(0.02)
                 if robo_ativo.is_set():
                     robo_ativo.clear()
                     parar()
-                    print("[BOTAO] PAROU (aperte de novo pra reiniciar)")
+                    print("[BOTAO] PAUSADO (aperte de novo pra retomar)")
                     # mover_servo() normal chama checar_parada() a cada passo -
                     # abortaria na hora (acabamos de limpar robo_ativo) e
                     # mataria essa propria thread. Por isso a versao direta.
@@ -355,23 +351,13 @@ def botao_thread():
                         mover_servo_direto(PINO_PESADO, SERVO_PESADO_ANGULO_PARADO)
                     except Exception as e:
                         print(f"[BOTAO][ERRO] Falha ao abaixar servo pesado: {e}")
-                elif not ja_foi_ativado:
-                    # Primeira ativacao desse processo (boot fresco, nunca
-                    # rodou ainda) - so liga normal, sem reiniciar. Reiniciar
-                    # aqui nao teria nenhum estado velho pra limpar e so
-                    # ficava reiniciando em loop sem nunca chegar a andar.
-                    print("[BOTAO] INICIANDO...")
-                    ja_foi_ativado = True
+                else:
+                    print("[BOTAO] RETOMANDO...")
                     robo_ativo.set()
                     try:
                         mover_servo_direto(PINO_PESADO, SERVO_PESADO_ANGULO_ATIVO)
                     except Exception as e:
                         print(f"[BOTAO][ERRO] Falha ao levantar servo pesado: {e}")
-                else:
-                    # Ja tinha rodado antes e foi parado - agora sim reinicia
-                    # o processo inteiro do zero, igual parar no terminal e
-                    # rodar de novo. Ver reiniciar_processo().
-                    reiniciar_processo()
         anterior = estado
         time.sleep(0.02)
 
