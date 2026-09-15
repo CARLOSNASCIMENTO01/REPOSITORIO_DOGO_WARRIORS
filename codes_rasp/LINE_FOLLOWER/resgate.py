@@ -37,16 +37,24 @@ NOME_COR_ENTREGA = {
 
 green_min = np.array([40, 50, 45])
 green_max = np.array([85, 255, 255])
-red_min1 = np.array([0, 100, 100])
-red_max1 = np.array([10, 255, 255])
-red_min2 = np.array([170, 100, 100])
-red_max2 = np.array([180, 255, 255])
+red_min1 = np.array([0, 69, 0])
+red_max1 = np.array([8, 255, 255])
+red_min2 = np.array([157, 123, 0])
+red_max2 = np.array([179, 255, 255])
 kernel_tri = np.ones((3, 3), np.uint8)
 
 PROPORCAO_ESPERADA = 30 / 6
 TOLERANCIA_PROPORCAO = 0.8
 AREA_MIN_TRI = 2500 #500 - baixo demais, deixava passar ruido pequeno (blob de ~510px que nao era triangulo nenhum)
 AREA_MAX_TRI = 1000000
+
+# So pra acionar_saida(): area minima maior que o normal, exigindo um blob
+# bem mais confiante antes de aceitar como canto - na saida um falso
+# positivo (sombra/reflexo/vazamento de cor perto da abertura de verdade)
+# custa caro (desvia o robo da saida real), entao vale ser mais rigoroso
+# aqui do que durante a entrega normal (onde o triangulo as vezes ainda
+# esta longe/pequeno e precisa do limiar mais baixo pra ser visto a tempo).
+AREA_MIN_TRI_SAIDA = 6000
 
 STOP_AREA_RATIO_TRIANGULO = 0.80
 TRIANGULO_MAX_GIROS = 90
@@ -66,7 +74,6 @@ TOLERANCE = 30
 
 DEBUG_VISUAL = False
 
-YAHBOOM_PORTA = "/dev/serial/by-path/platform-xhci-hcd.0-usb-0:1:1.0-port0"
 YAHBOOM_BAUDRATE = 115200
 ESCALA_PWM_YAHBOOM = 70
 PWM_FREIO_YAHBOOM = 700
@@ -75,13 +82,13 @@ TEMPO_FREIO_YAHBOOM = 0.08
 VEL_MAX = 20
 VEL_MIN = -VEL_MAX
 
-APPROACH_SPEED = 25#23
-APPROACH_STEP_TIME = 0.18
+APPROACH_SPEED = 30#25
+APPROACH_STEP_TIME = 0.18#0.18
 STOP_AREA_RATIO = 0.85
 MAX_APPROACH_STEPS = 60
 LOST_BALL_FRAMES = 8
-TURN_PULSE = 0.16
-STOP_TIME = 0.2#0.2
+TURN_PULSE = 0.2#0.16
+STOP_TIME = 0.1#0.2
 FORWARD_TIME = 0.6
 
 CENTER_TURN_SPEED_MIN = 15
@@ -107,6 +114,22 @@ TOLERANCIA_ANGULO_HORIZONTAL_LINHA = 58  # calibrado ao vivo, era 58
 
 DIST_LATERAL_ABERTA_CM = 30
 DIST_PAREDE_FRENTE_CM = 10
+
+# codigo_arduino.ino manda exatamente 255.0 quando o eco do ultrassonico nao
+# volta a tempo (pulseIn timeout) OU quando a leitura sai da faixa valida -
+# ou seja, "255" tanto pode ser "nao tem nada por perto" quanto "sensor
+# falhou nessa leitura", sem distincao nenhuma. Isso fazia toda falha de
+# leitura (rotina em sonar ultrassonico perto de parede angulada) ser lida
+# como "lateral aberta" pelo DIST_LATERAL_ABERTA_CM, causando falso positivo
+# ~4 em cada 10 vezes. distancia_frente()/distancia_esquerda() abaixo
+# reconhecem esse 255 explicito e devolvem SONAR_INVALIDO (9999, mesmo
+# sentinela ja usado em dados{} antes do primeiro dado chegar) no lugar -
+# quem checa "lateral aberta" tem que excluir esse valor, nao so comparar
+# ">" com DIST_LATERAL_ABERTA_CM.
+SONAR_INVALIDO = 9999
+LIMIAR_ERRO_SONAR_CM = 254  # >= isso e o "255.0" de erro do firmware (folga de arredondamento)
+
+FRAMES_CONFIRMACAO_LATERAL = 5  # leituras seguidas exigidas antes de confiar que a lateral abriu
 
 VEL_SAIDA = 15
 TEMPO_MAX_CONFIRMAR_LATERAL = 1.0
@@ -217,10 +240,21 @@ def detectar_porta(sair_se_falhar=True):
     except serial.SerialException:
         pass
 
+    # A porta da placa Yahboom (motor_serial) nunca pode ser tambem
+    # escolhida aqui pro Arduino - senao os dois ficam abrindo o MESMO
+    # device concorrentemente (visto ao vivo: PWM do motor falhando com
+    # I/O error e o sonar nunca recebendo dado valido, preso reconectando
+    # em loop). So acontece quando o ID fixo acima falha e cai nas buscas
+    # genericas abaixo, mas vale excluir sempre. Mesma correcao ja aplicada
+    # em config.py:detectar_porta().
+    porta_motor = motor_serial.port if motor_serial is not None else None
+
     PALAVRAS_FTDI = ["ftdi", "ft232", "usb serial converter", "ftb6spl3"]
     portas = serial.tools.list_ports.comports()
 
     for p in portas:
+        if p.device == porta_motor:
+            continue
         desc = f"{p.description} {p.manufacturer or ''} {p.hwid or ''}".lower()
         if any(palavra in desc for palavra in PALAVRAS_FTDI):
             try:
@@ -231,6 +265,8 @@ def detectar_porta(sair_se_falhar=True):
                 continue
 
     for p in portas:
+        if p.device == porta_motor:
+            continue
         if "ttyUSB" in p.device or "ttyACM" in p.device:
             try:
                 s = serial.Serial(p.device, 115200, timeout=0.04)
@@ -250,6 +286,48 @@ def aguardar_porta(intervalo=1.0):
         print("[Serial] Arduino ainda nao apareceu, tentando de novo...")
         time.sleep(intervalo)
         porta = detectar_porta(sair_se_falhar=False)
+    return porta
+
+def _detectar_porta_yahboom(sair_se_falhar=True):
+    """Acha a porta serial da placa Yahboom pelo VID:PID (1a86:7522, CH340
+    generico), nao por um caminho fisico fixo (by-path) - esse caminho e
+    atrelado ao SLOT USB, nao ao dispositivo, entao se a placa mudar de
+    porta um by-path antigo passaria a apontar pra outro device qualquer
+    (ex: o Arduino), que abre serial sem erro nenhum mas nao e a Yahboom -
+    o sintoma seria o robo "conectar" normal e os motores simplesmente nao
+    se mexerem. Mesma correcao ja aplicada em config.py."""
+    for p in serial.tools.list_ports.comports():
+        if (p.vid, p.pid) == (0x1a86, 0x7522):
+            try:
+                s = serial.Serial(p.device, YAHBOOM_BAUDRATE, timeout=0.5)
+                print(f"[MOTOR] Placa Yahboom encontrada em: {p.device}")
+                return s
+            except serial.SerialException:
+                continue
+
+    if sair_se_falhar:
+        print("[MOTOR][ERRO] Placa Yahboom nao encontrada!")
+        sys.exit(1)
+    return None
+
+def _aguardar_porta_yahboom(intervalo=1.0):
+    """Espera a placa Yahboom aparecer em vez de derrubar o processo
+    inteiro se ela nao estiver plugada nesse instante do boot - antes,
+    serial.Serial(YAHBOOM_PORTA, ...) direto no boot crashava o resgate
+    inteiro se a placa nao estivesse pronta bem na hora."""
+    porta = _detectar_porta_yahboom(sair_se_falhar=False)
+    tentativas = 0
+    while porta is None:
+        tentativas += 1
+        print(f"[MOTOR] Placa Yahboom ainda nao apareceu, tentando de novo... ({tentativas})")
+        time.sleep(intervalo)
+        porta = _detectar_porta_yahboom(sair_se_falhar=False)
+    # CH340/firmware da placa costuma resetar quando a serial e reaberta -
+    # sem essa espera os primeiros $pwm: saem enquanto ela ainda esta
+    # subindo e sao ignorados sem erro nenhum.
+    print("[MOTOR] Placa Yahboom encontrada, esperando ela terminar de subir...")
+    time.sleep(2.0)
+    print("[MOTOR] Pronta")
     return porta
 
 def handshake_serial():
@@ -331,10 +409,20 @@ def serial_thread():
             time.sleep(1.0)
 
 def distancia_frente():
-    return dados["F"]
+    valor = dados["F"]
+    return SONAR_INVALIDO if valor >= LIMIAR_ERRO_SONAR_CM else valor
 
 def distancia_esquerda():
-    return dados["E"]
+    valor = dados["E"]
+    return SONAR_INVALIDO if valor >= LIMIAR_ERRO_SONAR_CM else valor
+
+def lateral_aberta():
+    """True so com leitura valida (nao o 255 de erro do firmware) e de
+    verdade acima do limiar - usado com confirmacao em varios frames
+    seguidos (FRAMES_CONFIRMACAO_LATERAL) antes de agir, pra nao reagir a
+    uma falha de leitura isolada do ultrassonico."""
+    d = distancia_esquerda()
+    return sonar_valido() and DIST_LATERAL_ABERTA_CM < d < SONAR_INVALIDO
 
 def sonar_valido():
     return (time.time() - ultimo_recebimento) < SERIAL_TIMEOUT_DADO
@@ -839,17 +927,22 @@ def _maior_contorno_linha(frame):
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_linha)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
+    maior = None
+    if contours:
+        candidato = max(contours, key=cv2.contourArea)
+        area_contorno = cv2.contourArea(candidato)
+        area_roi = roi.shape[0] * roi.shape[1]
+        if AREA_MIN_LINHA <= area_contorno < area_roi * AREA_MAX_LINHA_FRAC:
+            maior = candidato
 
-    maior = max(contours, key=cv2.contourArea)
-    area_contorno = cv2.contourArea(maior)
-    area_roi = roi.shape[0] * roi.shape[1]
+    if DEBUG_VISUAL:
+        debug_img = roi.copy()
+        if maior is not None:
+            cv2.drawContours(debug_img, [maior], -1, (0, 255, 0), 2)
+        cv2.imshow("SAIDA - camera de baixo (vertical)", debug_img)
+        cv2.imshow("SAIDA - mascara vertical", mask)
+        cv2.waitKey(1)
 
-    if area_contorno < AREA_MIN_LINHA:
-        return None
-    if area_contorno >= area_roi * AREA_MAX_LINHA_FRAC:
-        return None
     return maior
 
 def detectar_linha_embaixo(frame):
@@ -872,17 +965,22 @@ def _maior_contorno_linha_h(frame):
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_linha)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
+    maior = None
+    if contours:
+        candidato = max(contours, key=cv2.contourArea)
+        area_contorno = cv2.contourArea(candidato)
+        area_roi = roi.shape[0] * roi.shape[1]
+        if AREA_MIN_LINHA_H <= area_contorno < area_roi * AREA_MAX_LINHA_FRAC_H:
+            maior = candidato
 
-    maior = max(contours, key=cv2.contourArea)
-    area_contorno = cv2.contourArea(maior)
-    area_roi = roi.shape[0] * roi.shape[1]
+    if DEBUG_VISUAL:
+        debug_img = roi.copy()
+        if maior is not None:
+            cv2.drawContours(debug_img, [maior], -1, (255, 0, 0), 2)
+        cv2.imshow("SAIDA - camera de baixo (horizontal)", debug_img)
+        cv2.imshow("SAIDA - mascara horizontal", mask)
+        cv2.waitKey(1)
 
-    if area_contorno < AREA_MIN_LINHA_H:
-        return None
-    if area_contorno >= area_roi * AREA_MAX_LINHA_FRAC_H:
-        return None
     return maior
 
 def detectar_linha_horizontal_embaixo(frame):
@@ -895,6 +993,10 @@ def detectar_linha_horizontal_embaixo(frame):
     return desvio_horizontal <= TOLERANCIA_ANGULO_HORIZONTAL_LINHA
 
 def confirmar_saida_lateral():
+    """So confirma abertura lateral (sonar) como saida de verdade se o
+    contorno visto na camera de baixo for HORIZONTAL - vertical e "entrada"
+    (falso positivo, mesmo criterio de acionar_saida()) e a ausencia de
+    contorno tambem nao confirma nada, so ignora e continua tentando."""
     achou = False
     inicio = time.time()
     while time.time() - inicio < 3.0:
@@ -902,7 +1004,7 @@ def confirmar_saida_lateral():
         mover(VEL_SAIDA, VEL_SAIDA)
         if cap_linha is not None:
             ret_l3, frame_l3 = cap_linha.read()
-            if ret_l3 and detectar_linha_embaixo(frame_l3):
+            if ret_l3 and detectar_linha_horizontal_embaixo(frame_l3):
                 achou = True
                 break
         time.sleep(0.02)
@@ -912,32 +1014,26 @@ def confirmar_saida_lateral():
 def alinhar_na_linha():
     mover(20, 20)
     time.sleep(0.7)
-    guinada2('E', 18, 20)
+    guinada2('E', 25, 20)
 
-    TOLERANCIA_CENTRO_LINHA = 30
+    # Nao precisa centralizar o contorno (cx) - so ver a linha aparecer ja
+    # basta, igual confirmar_saida_lateral() ja fazia com detectar_linha_embaixo().
     FRAMES_CONFIRMACAO = 3
     ALINHAR_VEL = 13
-    frames_centralizado_seguidos = 0
+    frames_detectados_seguidos = 0
     while True:
         checar_parada()
         mover(ALINHAR_VEL, -ALINHAR_VEL)
         ret_l, frame_l = cap_linha.read()
-        if ret_l:
-            maior = _maior_contorno_linha(frame_l)
-            cx = None
-            if maior is not None:
-                M = cv2.moments(maior)
-                if M["m00"] != 0:
-                    cx = int(M["m10"] / M["m00"])
-            centro = frame_l.shape[1] // 2
-            centralizado = cx is not None and abs(cx - centro) < TOLERANCIA_CENTRO_LINHA
-            frames_centralizado_seguidos = frames_centralizado_seguidos + 1 if centralizado else 0
-            print(f"[SAIDA-ALINHA] cx={cx} centralizado={centralizado} seguidos={frames_centralizado_seguidos}")
-            if frames_centralizado_seguidos >= FRAMES_CONFIRMACAO:
-                print("[SAIDA] Contorno da linha encontrado de novo, alinhado")
-                break
+        detectado = ret_l and detectar_linha_embaixo(frame_l)
+        frames_detectados_seguidos = frames_detectados_seguidos + 1 if detectado else 0
+        print(f"[SAIDA-ALINHA] detectado={detectado} seguidos={frames_detectados_seguidos}")
+        if frames_detectados_seguidos >= FRAMES_CONFIRMACAO:
+            print("[SAIDA] Contorno da linha encontrado de novo, alinhado")
+            break
         time.sleep(0.005)
     parar_motores()
+    guinada2('D', 15, 20)
 
 
 # ===================== FUNCOES DE BOLA =====================
@@ -1017,7 +1113,7 @@ def centralizar_bola():
         time.sleep(0.05)
 
     print("Estourou tentativas de centralização")
-    mover(20, 20)
+    mover(-20, -20)
     time.sleep(0.15)
     guinada2('E', 5, 15)
     parar_motores()
@@ -1042,7 +1138,7 @@ def aproximar_bola():
             print(f"Bola sumiu durante aproximação ({perdida}/{LOST_BALL_FRAMES})")
             if perdida >= LOST_BALL_FRAMES:
                 print("Perdeu a bola de vez, abortando aproximação")
-                mover(20, 20)
+                mover(-20, -20)
                 time.sleep(0.15)
                 guinada2('E', 5, 15)
                 parar_motores()
@@ -1128,6 +1224,17 @@ def verificar_e_afastar_bola_bloqueio():
         return
 
     cx, area, bbox, cls_id = detectar_bola(crop)
+
+    if DEBUG_VISUAL:
+        debug_img = crop.copy()
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.putText(debug_img, "BLOQUEANDO", (x1, max(y1 - 5, 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        cv2.imshow("ENTREGA - checando bola bloqueando", debug_img)
+        cv2.waitKey(1)
+
     if cx is not None:
         print("Bola bloqueando a área de entrega, afastando...")
         afastar_bola_do_canto()
@@ -1153,9 +1260,9 @@ def _mascara_cor_tri(hsv, cor):
     mask = cv2.dilate(mask, kernel_tri, iterations=2)
     return mask
 
-def _eh_triangulo(contorno, encostando_borda=False):
+def _eh_triangulo(contorno, encostando_borda=False, area_min=AREA_MIN_TRI):
     area = cv2.contourArea(contorno)
-    if area < AREA_MIN_TRI or area > AREA_MAX_TRI:
+    if area < area_min or area > AREA_MAX_TRI:
         return False, None
 
     perimetro = cv2.arcLength(contorno, True)
@@ -1181,7 +1288,7 @@ def _eh_triangulo(contorno, encostando_borda=False):
         "vertices": aproximado.reshape(-1, 2),
     }
 
-def detectar_entrega(crop):
+def detectar_entrega(crop, area_min=AREA_MIN_TRI):
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     cores = [ALVO_COR] if ALVO_COR else ["verde", "vermelho"]
 
@@ -1206,7 +1313,7 @@ def detectar_entrega(crop):
                 y + h_bb >= crop.shape[0] - margem
             )
 
-            ok, info = _eh_triangulo(c, encostando_borda=encostando_borda)
+            ok, info = _eh_triangulo(c, encostando_borda=encostando_borda, area_min=area_min)
             if ok:
                 info["cor"] = cor
                 todas_deteccoes.append(info)
@@ -1472,28 +1579,72 @@ def acionar_saida():
     time.sleep(0.8)
     guinada2('D', 45, 15)
     print(distancia_esquerda())
+    '''mover(30,30)
+    time.sleep(0.3)
+    guinada2('D', 85, 20)
+    mover(-50,-50)
+    time.sleep(1.0)
+    mover(20,20)
+    time.sleep(0.2)
+    guinada2('E', 85, 20)'''
     if distancia_esquerda() <= 2:
+        print("menor que 2")
         mover(20, 0)
-        time.sleep(0.70)
+        time.sleep(0.65)
         parar_motores()
         mover(0, 20)
         time.sleep(0.60)
         parar_motores()
-    elif distancia_esquerda() <= 5:
+        mover(-15, -15)
+        time.sleep(0.2)
+        parar_motores()
+    elif distancia_esquerda() <= 5 and distancia_esquerda() > 2:
+        print("menor que 5")
         mover(20, 0)
-        time.sleep(0.40)
+        time.sleep(0.35)
         parar_motores()
         mover(0, 20)
         time.sleep(0.30)
         parar_motores()    
-    elif distancia_esquerda() >= 9: 
+        mover(-15, -15)
+        time.sleep(0.2)
+        parar_motores()
+    elif distancia_esquerda() >= 6 and distancia_esquerda() <= 7.7:
+        print("maior que 6")
+        mover(20, 0)
+        time.sleep(0.20)
+        parar_motores()
+        mover(0, 20)
+        time.sleep(0.20)
+        parar_motores()    
+        mover(-15, -15)
+        time.sleep(0.2)
+        parar_motores()    
+    elif distancia_esquerda() >= 10 and distancia_esquerda() <= 13: 
+        print("maior que 10")
         mover(20,20)
         time.sleep(0.5)
         mover(0, 20)
-        time.sleep(0.60)
+        time.sleep(0.50)
         parar_motores()
         mover(20, 0)
-        time.sleep(0.60)
+        time.sleep(0.50)
+        parar_motores()
+        mover(-15, -15)
+        time.sleep(0.2)
+        parar_motores()    
+    elif distancia_esquerda() >= 13: 
+        print("maior que 13")
+        mover(20,20)
+        time.sleep(0.5)
+        mover(0, 20)
+        time.sleep(0.80)
+        parar_motores()
+        mover(20, 0)
+        time.sleep(0.80)
+        parar_motores()
+        mover(-15, -15)
+        time.sleep(0.2)
         parar_motores()
     print(distancia_esquerda())
 
@@ -1505,6 +1656,7 @@ def acionar_saida():
     FRAMES_CONFIRMACAO_LINHA = 7  #3
     frames_vertical_seguidos = 0
     frames_horizontal_seguidos = 0
+    frames_lateral_seguidos = 0
 
     try:
         while True:
@@ -1514,46 +1666,83 @@ def acionar_saida():
             ret_r, frame_r = cap.read()
             if ret_r and time.time() >= ignorar_canto_ate:
                 crop = center_crop(frame_r, CROP_W, CROP_H)
-                cx, area, info = detectar_entrega(crop)
+                cx, area, info = detectar_entrega(crop, area_min=AREA_MIN_TRI_SAIDA)
                 if cx is not None:
-                    parar_motores()
-                    cor_achada = info["cor"] if info else "?"
-                    print(f"[SAIDA] Canto {cor_achada} detectado na camera de resgate")
-                    print("vi um tringulozao verde ou vermelho")
-                    mover(25, 25)
-                    time.sleep(2.0)
-                    mover(-25, -25)
-                    time.sleep(0.4)
-                    guinada2('D', 90, 15)
-                    mover(15,15)
-                    time.sleep(2.2)
-                    guinada2('D', 33, 15)
-                    print(distancia_esquerda())
-                    if distancia_esquerda() <= 2:
-                        mover(20, 0)
-                        time.sleep(0.70)
+                    if distancia_frente() < 40:
                         parar_motores()
-                        mover(0, 20)
-                        time.sleep(0.60)
-                        parar_motores()
-                    elif distancia_esquerda() <= 5:
-                        mover(20, 0)
-                        time.sleep(0.40)
-                        parar_motores()
-                        mover(0, 20)
-                        time.sleep(0.30)
-                        parar_motores()    
-                    elif distancia_esquerda() >= 9: 
-                        mover(20,20)
-                        time.sleep(0.5)
-                        mover(0, 20)
-                        time.sleep(0.60)
-                        parar_motores()
-                        mover(20, 0)
-                        time.sleep(0.60)
-                        parar_motores()
-                    print(distancia_esquerda())
-                    ignorar_canto_ate = time.time() + TEMPO_IGNORAR_CANTO
+                        cor_achada = info["cor"] if info else "?"
+                        print(f"[SAIDA] Canto {cor_achada} detectado na camera de resgate")
+                        print("vi um tringulozao verde ou vermelho")
+                        mover(25, 25)
+                        time.sleep(2.0)
+                        mover(-25, -25)
+                        time.sleep(0.4)
+                        guinada2('D', 90, 15)
+                        mover(15,15)
+                        time.sleep(2.2)
+                        guinada2('D', 33, 15)
+                        print(distancia_esquerda())
+                        if distancia_esquerda() <= 2:
+                            print("menor que 2")
+                            mover(20, 0)
+                            time.sleep(0.65)
+                            parar_motores()
+                            mover(0, 20)
+                            time.sleep(0.60)
+                            parar_motores()
+                            mover(-15, -15)
+                            time.sleep(0.2)
+                            parar_motores()
+                        elif distancia_esquerda() <= 5 and distancia_esquerda() > 2:
+                            print("menor que 5")
+                            mover(20, 0)
+                            time.sleep(0.35)
+                            parar_motores()
+                            mover(0, 20)
+                            time.sleep(0.30)
+                            parar_motores()    
+                            mover(-15, -15)
+                            time.sleep(0.2)
+                            parar_motores()
+                        elif distancia_esquerda() >= 6 and distancia_esquerda() <= 7.7:
+                            print("maior que 6")
+                            mover(20, 0)
+                            time.sleep(0.20)
+                            parar_motores()
+                            mover(0, 20)
+                            time.sleep(0.20)
+                            parar_motores()    
+                            mover(-15, -15)
+                            time.sleep(0.2)
+                            parar_motores()    
+                        elif distancia_esquerda() >= 10 and distancia_esquerda() <= 13: 
+                            print("maior que 10")
+                            mover(20,20)
+                            time.sleep(0.5)
+                            mover(0, 20)
+                            time.sleep(0.50)
+                            parar_motores()
+                            mover(20, 0)
+                            time.sleep(0.50)
+                            parar_motores()
+                            mover(-15, -15)
+                            time.sleep(0.2)
+                            parar_motores()    
+                        elif distancia_esquerda() >= 13: 
+                            print("maior que 13")
+                            mover(20,20)
+                            time.sleep(0.5)
+                            mover(0, 20)
+                            time.sleep(0.80)
+                            parar_motores()
+                            mover(20, 0)
+                            time.sleep(0.80)
+                            parar_motores()
+                            mover(-15, -15)
+                            time.sleep(0.2)
+                            parar_motores()
+                        print(distancia_esquerda())
+                        ignorar_canto_ate = time.time() + TEMPO_IGNORAR_CANTO
 
             if cam_linha is not None:
                 ret_l, frame_l = cam_linha.read()
@@ -1587,7 +1776,7 @@ def acionar_saida():
                 achou_canto = False
                 if ret_r and time.time() >= ignorar_canto_ate:
                     crop = center_crop(frame_r, CROP_W, CROP_H)
-                    cx, area, info = detectar_entrega(crop)
+                    cx, area, info = detectar_entrega(crop, area_min=AREA_MIN_TRI_SAIDA)
                     if cx is not None:
                         achou_canto = True
                         parar_motores()
@@ -1604,33 +1793,82 @@ def acionar_saida():
                         guinada2('D', 33, 15)
                         print(distancia_esquerda())
                         if distancia_esquerda() <= 2:
+                            print("menor que 2")
                             mover(20, 0)
-                            time.sleep(0.70)
+                            time.sleep(0.65)
                             parar_motores()
                             mover(0, 20)
                             time.sleep(0.60)
                             parar_motores()
-                        elif distancia_esquerda() <= 5:
+                            mover(-15, -15)
+                            time.sleep(0.2)
+                            parar_motores()
+                        elif distancia_esquerda() <= 5 and distancia_esquerda() > 2:
+                            print("menor que 5")
                             mover(20, 0)
-                            time.sleep(0.40)
+                            time.sleep(0.35)
                             parar_motores()
                             mover(0, 20)
                             time.sleep(0.30)
                             parar_motores()    
-                        elif distancia_esquerda() >= 9: 
+                            mover(-15, -15)
+                            time.sleep(0.2)
+                            parar_motores()
+                        elif distancia_esquerda() >= 6 and distancia_esquerda() <= 7.7:
+                            print("maior que 6")
+                            mover(20, 0)
+                            time.sleep(0.20)
+                            parar_motores()
+                            mover(0, 20)
+                            time.sleep(0.20)
+                            parar_motores()    
+                            mover(-15, -15)
+                            time.sleep(0.2)
+                            parar_motores()    
+                        elif distancia_esquerda() >= 10 and distancia_esquerda() <= 13: 
+                            print("maior que 10")
                             mover(20,20)
                             time.sleep(0.5)
                             mover(0, 20)
-                            time.sleep(0.60)
+                            time.sleep(0.50)
                             parar_motores()
                             mover(20, 0)
-                            time.sleep(0.60)
+                            time.sleep(0.50)
+                            parar_motores()
+                            mover(-15, -15)
+                            time.sleep(0.2)
+                            parar_motores()    
+                        elif distancia_esquerda() >= 13: 
+                            print("maior que 13")
+                            mover(20,20)
+                            time.sleep(0.5)
+                            mover(0, 20)
+                            time.sleep(0.80)
+                            parar_motores()
+                            mover(20, 0)
+                            time.sleep(0.80)
+                            parar_motores()
+                            mover(-15, -15)
+                            time.sleep(0.2)
                             parar_motores()
                         print(distancia_esquerda())
                         ignorar_canto_ate = time.time() + TEMPO_IGNORAR_CANTO
 
                 if not achou_canto:
-                    if sonar_valido() and distancia_esquerda() > DIST_LATERAL_ABERTA_CM:
+                    lateral_confirmada = False
+                    if lateral_aberta():
+                        parar_motores()
+                        confirmacoes = 1
+                        for _ in range(FRAMES_CONFIRMACAO_LATERAL - 1):
+                            checar_parada()
+                            time.sleep(0.05)
+                            if lateral_aberta():
+                                confirmacoes += 1
+                            else:
+                                break
+                        lateral_confirmada = confirmacoes >= FRAMES_CONFIRMACAO_LATERAL
+
+                    if lateral_confirmada:
                         print(distancia_esquerda())
                         parar_motores()
                         print("[SAIDA] Ultrassonico lateral aberto, confirmando com a camera de baixo...")
@@ -1657,7 +1895,9 @@ def acionar_saida():
                         aguardar_leitura_fresca_sonar()
 
             aguardar_leitura_fresca_sonar()
-            if sonar_valido() and distancia_esquerda() > DIST_LATERAL_ABERTA_CM:
+            frames_lateral_seguidos = frames_lateral_seguidos + 1 if lateral_aberta() else 0
+            if frames_lateral_seguidos >= FRAMES_CONFIRMACAO_LATERAL:
+                frames_lateral_seguidos = 0
                 print(distancia_esquerda())
                 parar_motores()
                 print("[SAIDA] Ultrassonico lateral aberto, confirmando com a camera de baixo...")
@@ -1691,7 +1931,7 @@ GPIO.gpio_claim_input(h, BUTTON, GPIO.SET_PULL_UP)
 
 iniciar_mpu_thread()
 
-motor_serial = serial.Serial(YAHBOOM_PORTA, YAHBOOM_BAUDRATE, timeout=0.5)
+motor_serial = _aguardar_porta_yahboom()
 
 threading.Thread(target=watchdog_nudge, daemon=True).start()
 threading.Thread(target=watchdog_seguranca, daemon=True).start()

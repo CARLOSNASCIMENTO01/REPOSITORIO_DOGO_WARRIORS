@@ -15,7 +15,7 @@ Toda a pasta está liberada pra edição — não existe área "read-only" aqui.
 | Sensor TCRT | GPIO `6` |
 | Servo garra SG90 | GPIO `5` (`PINO_SG90`) |
 | Servo pesado | GPIO `20` (`PINO_PESADO`) |
-| MPU6050 | I2C via `smbus2` (thread própria, eixo Y = rampa/gangorra) |
+| BNO055 | I2C via `smbus2`, `0x29` (thread própria, modo ACCGYRO sem fusão/magnetômetro, eixo Y = rampa/gangorra) |
 | Arduino Nano | serial FTDI, `PORTA_FIXA` em `/dev/serial/by-id/usb-FTDI_...` |
 | Câmera da linha | índice fallback `0` |
 | Câmera da vítima | índice fallback `2` |
@@ -24,14 +24,16 @@ GPIO é sempre `lgpio` (não RPi.GPIO). PWM dos motores em 50 Hz via `GPIO.tx_pw
 
 ## Como roda
 
-`/etc/systemd/system/robo.service` → `env_dogo/bin/python3 codes_rasp/PROTOTIPAGEM_LINE/seguidor_debug2.py`
-(`Restart=on-failure`, `WorkingDirectory` = `PROTOTIPAGEM_LINE/`).
+`/etc/systemd/system/robo.service` → `env_dogo/bin/python3 codes_rasp/LINE_FOLLOWER/main.py`
+(`Restart=on-failure`, `WorkingDirectory` continua sendo `PROTOTIPAGEM_LINE/` de propósito
+— é lá que ficam os `.onnx` e outros paths relativos que o código ainda espera; o script
+em si mora em `LINE_FOLLOWER/`, mas o processo roda com esse cwd).
 
 O robô é uma **cadeia de scripts que se substituem via `os.execv`**, não um processo só:
 
 ```
-seguidor_debug2.py  --(area(): achou área de resgate)-->  resgate.py --entregas=N
-resgate.py          --(MAX_ENTREGAS atingido / botão)-->  seguidor_debug2.py --auto
+main.py     --(area(): achou área de resgate)-->  resgate.py --entregas=N
+resgate.py  --(MAX_ENTREGAS atingido / botão)-->   main.py --auto
 ```
 
 - `--auto` → já começa com `robo_ativo.set()` (sem esperar o botão).
@@ -47,12 +49,26 @@ codigo_arduino/codigo_arduino.ino    Nano: 2 sonares (TRIG/ECHO 3/2 e 6/5),
 
 codes_rasp/
   upload.sh                          arduino-cli upload (caminho ainda aponta p/ ~/OPENCV_LINE)
-  LINE_FOLLOWER/
-    line_complet.py                  cópia do seguidor (é o arquivo com alterações
-                                     não commitadas no git)
-  PROTOTIPAGEM_LINE/                 pasta de trabalho — é daqui que o systemd roda
-    seguidor_debug2.py               ** SEGUIDOR PRINCIPAL ** (o que o service executa)
-    seguidor_debug.py                versão anterior, sem os servos
+  LINE_FOLLOWER/                     ** SEGUIDOR PRINCIPAL ** (o que o service executa,
+                                     via main.py) — dividido em módulos por assunto:
+    main.py                          entry point: boot + loop_principal() (o único
+                                     arquivo que o robo.service chama)
+    config.py                        hardware: RoboParado/robo_ativo/checar_parada,
+                                     GPIO, motores Yahboom, servos, botão, BNO055,
+                                     serial do Arduino (sonar), câmera de linha (cap)
+    movimentos_bases.py              guinada2() / guinada_pid()
+    seguimento_de_linha.py           visao(), controle() (PID que segue a linha),
+                                     detecção/reação aos marcadores verdes
+    obstaculos_trajeto.py            desvio() por sonar frontal
+    resgate_de_vitimas.py            identificar_vitimas() (YOLO, não é chamada
+                                     hoje) + area() (handoff pro resgate.py)
+    line_complet.py                  cópia antiga e paralela do seguidor (monolítica,
+                                     de antes da divisão em módulos) — não roda no
+                                     robô, não mantida em sincronia com main.py e cia
+  PROTOTIPAGEM_LINE/                 pasta de trabalho — WorkingDirectory do systemd
+                                     (o .onnx de vítima e afins ficam aqui, resolvidos
+                                     por path relativo mesmo com o script em LINE_FOLLOWER/)
+    seguidor_debug.py                versão anterior monolítica, sem os servos
     resgate.py                       ** RESGATE PRINCIPAL ** (bola + triângulo + entrega)
     RESGATE_CARLOS.py                variante do resgate, com busca de saída embutida
     proucurar_saida.py               rotina isolada de achar a saída (conta pixel preto)
@@ -71,13 +87,18 @@ codes_rasp/PROTOTIPAGEM_LINE/env_moondream/   venv só do Moondream
 
 ## Padrões que se repetem nos scripts grandes
 
-Os quatro arquivos grandes (`seguidor_debug2`, `line_complet`, `resgate`,
-`RESGATE_CARLOS`) são cópias divergentes do mesmo esqueleto — não existe módulo
-comum. **`seguidor_debug2.py` é o único seguidor de linha em uso de fato** (é o
-que o `robo.service` executa); `line_complet.py` e `seguidor_debug.py` são
+`resgate.py`/`RESGATE_CARLOS.py` e os seguidores antigos (`line_complet.py`,
+`seguidor_debug.py`) são cópias monolíticas divergentes do mesmo esqueleto —
+não existe módulo comum entre eles. O seguidor de linha **em uso de fato**
+(o que o `robo.service` executa) não é mais um arquivo só: é o conjunto
+`LINE_FOLLOWER/main.py` + `config.py` + `movimentos_bases.py` +
+`seguimento_de_linha.py` + `obstaculos_trajeto.py` + `resgate_de_vitimas.py`,
+dividido por assunto. `line_complet.py` e `seguidor_debug.py` continuam sendo
 cópias antigas/paralelas, não mantidas em sincronia. **Não propague correções
-pra elas automaticamente** — só edite `seguidor_debug2.py`, a menos que peçam
-explicitamente pra replicar em outro arquivo.
+pra elas automaticamente** — só edite os módulos em `LINE_FOLLOWER/`, a menos
+que peçam explicitamente pra replicar em outro arquivo. O mesmo vale pra
+`resgate.py`: é o script de resgate em uso de fato, mas ainda é monolítico
+(não foi dividido nessa reorganização).
 
 O esqueleto:
 
@@ -97,20 +118,23 @@ O esqueleto:
    serial e a câmera abrem, pra encurtar o boot.
 6. O `loop_principal()` nunca morre por exceção: erro é logado, motores param, tenta de novo.
 
-## Pipeline do seguidor (`seguidor_debug2.py`)
+## Pipeline do seguidor (`LINE_FOLLOWER/main.py` + módulos)
 
-`visao(frame)` → ROI inferior, máscara de preto (`black_max_top/bot`), maior contorno → `cx`
-→ `controle(cx, ...)` = PID (`Kp=1.8`, `Kd=0.7`, `VEL_BASE=25`, `DEADZONE=5`)
-com tratamento especial de gangorra por `angulo_y()`
-→ `verde(roi)` decide curva 90°/180° pelos marcadores verdes (`check_green` / `check_black`
-/ `determine_turn_direction`)
-→ `desvio()` usa o sonar frontal (`<= 6 cm`) pra contornar obstáculo
-→ `detectar_travamento()` compara frames (SSIM-like) pra sair de onde encravou
-→ `gap_debug()` + sonar esquerdo trata falta de linha; se persistir, chama `area()` → vai pro `resgate.py`
-→ `detectar_fita_vermelha()` = fim de percurso.
+`seguimento_de_linha.visao(frame)` → ROI inferior, máscara de preto (`black_max_top/bot`),
+maior contorno → `cx`
+→ `seguimento_de_linha.controle(cx, ...)` = PID (`Kp=0.35`, `Kd=0.3`, `VEL_BASE=15`,
+`DEADZONE=5` — ajustados com frequência, ver bloco CONFIG do próprio módulo)
+com tratamento especial de gangorra por `config.angulo_y()`
+→ `seguimento_de_linha.verde(roi)` decide curva 90°/180° pelos marcadores verdes
+(`check_green` / `check_black` / `determine_turn_direction`)
+→ `obstaculos_trajeto.desvio()` usa o sonar frontal (`<= 5 cm`) pra contornar obstáculo
+→ `seguimento_de_linha.detectar_travamento()` compara frames (SSIM-like) pra sair de onde encravou
+→ `gap_debug()` + sonar esquerdo trata falta de linha; se persistir, chama
+`resgate_de_vitimas.area()` → vai pro `resgate.py`
+→ `seguimento_de_linha.detectar_fita_vermelha()` = fim de percurso.
 
-Guinadas: `guinada2()` (tempo fixo) e `guinada_pid()` (fecha em cima do giroscópio,
-`ZONA_CHEGADA` graus de tolerância). `meiavolta()` para 180°.
+Guinadas (`movimentos_bases.py`): `guinada2()` (tempo fixo) e `guinada_pid()` (fecha em
+cima do giroscópio, `ZONA_CHEGADA` graus de tolerância).
 
 ## Pipeline do resgate (`resgate.py`)
 
@@ -119,7 +143,10 @@ em px) → `aproximar_bola()` (para quando `bbox_area / frame_area` passa do lim
 garra (`mover_servo(PINO_PESADO, ...)`) → `CLASSE_COR_ENTREGA` mapeia a classe YOLO da
 bola pra cor do triângulo → `buscar_triangulo()` / `centralizar_triangulo()` /
 `aproximar_triangulo()` (detecção por HSV + `_eh_triangulo()` no contorno) →
-`entregar_bola()`. Ao bater `MAX_ENTREGAS`, roda `acionar_saida()` e volta pro seguidor.
+`entregar_bola()`. Ao bater `MAX_ENTREGAS`, faz uma busca final (`buscar_bola()`); se achar
+bola sobrando, continua pegando e entregando normalmente (sem limite rígido). Se não achar
+mais nada, o `acionar_saida()` está **desativado a pedido** (comentado no código) — o robô
+só continua buscando, não sai sozinho pro seguidor nesse caso.
 
 ## Convenções
 

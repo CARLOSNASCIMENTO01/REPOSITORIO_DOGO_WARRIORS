@@ -111,9 +111,11 @@ def limpar_camera(n=5):
 # CONTROLE (segue linha) - PID
 # =========================================================================
 Kp = 0.9 #0.9
-Kd = 0.27 # 0.27
+Kd = 0.4 # 0.27
 VEL_BASE =20 #20
 DEADZONE = 0 # 8, 0
+ALPHA = 0.5  # filtro passa-baixa (EMA) do erro - peso do erro novo, (1-ALPHA) fica com o erro anterior
+LIMIAR_PIXELS_PRETO_GIRO = 21000  # so gira 180 no controle() se pixels_preto_ref passar disso
 
 contador_gangorra = 0
 ultimo_erro = 0
@@ -131,7 +133,8 @@ def controle(cx, contours, roi):
 
     if cx is not None:
         centro = w // 2
-        erro = (cx - centro) / centro * 100
+        erro_novo = (cx - centro) / centro * 100
+        erro = ALPHA * erro_novo + (1 - ALPHA) * ultimo_erro
     else:
         erro = ultimo_erro
 
@@ -151,8 +154,8 @@ def controle(cx, contours, roi):
         ajuste = (Kp * erro) + (Kd * derivada)
 
     print("angulo y ", config.angulo_y(), " | angulo z ", config.angulo_z())
-    if -5 < config.angulo_y() < 3 and contador_gangorra != 2:
-        contador_gangorra = 0
+    """if -5 < config.angulo_y() < 3 and contador_gangorra != 2:
+        contador_gangorra = 0"""
 
     # Muito verde na ROI (perto de um marcador de curva) - diminui a
     # velocidade pra dar mais estabilidade na hora de decidir a curva em
@@ -163,7 +166,7 @@ def controle(cx, contours, roi):
 
     if config.angulo_y() <= -10:
         contador_gangorra = 2
-        velocidade_base = 26
+        velocidade_base = 28
         velL = np.clip(velocidade_base + ajuste, config.VEL_MIN, config.VEL_MAX)
         velR = np.clip(velocidade_base - ajuste, config.VEL_MIN, config.VEL_MAX)
     elif pixels_verde_ctrl > 10000:
@@ -173,42 +176,23 @@ def controle(cx, contours, roi):
         velL = np.clip(velocidade_base + ajuste, -13, 13)
         velR = np.clip(velocidade_base - ajuste, -13, 13)
         if pixels_verde_ctrl > 24000:
-            # So vira se o verde nao estiver mais "colado" numa linha preta
-            # continuando embaixo dele - reusa o check_black() (o mesmo
-            # calculo que ja faz um marcador unico ser ignorado quando
-            # ainda esta apos uma linha preta, ainda nao chegou) em cima
-            # de so UM dos contornos verdes achados aqui. Nao precisa dos
-            # dois marcadores nem de nenhuma deteccao nova - so o sinal
-            # "baixo" (preto colado embaixo do verde = linha ainda
-            # conectada = nao chegou de verdade) que ja existe.
-            hsv_verde_ref = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            green_mask_ref = cv2.inRange(hsv_verde_ref, green_min, green_max)
-            green_mask_ref = cv2.dilate(green_mask_ref, kernal, iterations=3)
-            green_mask_ref = cv2.erode(green_mask_ref, kernal, iterations=2)
-            contornos_verde_ref, _ = cv2.findContours(green_mask_ref, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-            contornos_verde_ref = [c for c in contornos_verde_ref if cv2.contourArea(c) > MIN_GREEN_AREA]
+            # So pixel preto agora - sem check_black/apos_linha_preta (nao
+            # funcionava direito). 24000 de verde + mais de
+            # LIMIAR_PIXELS_PRETO_GIRO de preto = gira 180.
+            roi_h_ref, _ = roi.shape[:2]
+            corte_top_ref = int(roi_h_ref * 0.4)
+            black_ref = cv2.inRange(roi, black_min, black_max_bot)
+            black_ref[:corte_top_ref, :] = cv2.inRange(roi[:corte_top_ref, :], black_min, black_max_top)
+            black_ref = cv2.dilate(black_ref, kernal, iterations=3)
+            black_ref = cv2.erode(black_ref, kernal, iterations=2)
+            pixels_preto_ref = cv2.countNonZero(black_ref)
+            print(f"[VERDE-REF] pixels_verde={pixels_verde_ctrl} pixels_preto={pixels_preto_ref}")
 
-            apos_linha_preta = False
-            if contornos_verde_ref:
-                roi_h_ref, _ = roi.shape[:2]
-                corte_top_ref = int(roi_h_ref * 0.4)
-                black_ref = cv2.inRange(roi, black_min, black_max_bot)
-                black_ref[:corte_top_ref, :] = cv2.inRange(roi[:corte_top_ref, :], black_min, black_max_top)
-                black_ref = cv2.dilate(black_ref, kernal, iterations=3)
-                black_ref = cv2.erode(black_ref, kernal, iterations=2)
-
-                green_box_ref = cv2.boxPoints(cv2.minAreaRect(contornos_verde_ref[0]))
-                row_ref = check_black(np.zeros((1, 5), dtype=np.int16), 0, green_box_ref, black_ref)
-                apos_linha_preta = row_ref[0, 0] == 1  # baixo=1 -> linha preta ainda conectada embaixo
-                print(f"[VERDE-REF] contornos_verde={len(contornos_verde_ref)} box={green_box_ref.tolist()} "
-                      f"voto(baixo,cima,esq,dir)={row_ref[0, :4].tolist()} apos_linha_preta={apos_linha_preta}")
-            else:
-                print("[VERDE-REF] nenhum contorno verde grande achado pra referencia")
-
-            if apos_linha_preta:
-                print(f"[VERDE-CONTROLE] pixels_verde={pixels_verde_ctrl} - verde apos linha preta, ignorando giro")
+            if pixels_preto_ref <= LIMIAR_PIXELS_PRETO_GIRO:
+                print(f"[VERDE-CONTROLE] pixels_preto={pixels_preto_ref} <= {LIMIAR_PIXELS_PRETO_GIRO}, ignorando giro")
             else:
                 print("gira 180")
+
                 config.mover(-2, -2)
                 time.sleep(0.3)
                 movimentos_bases.guinada2("D", 170, 20)
@@ -251,18 +235,19 @@ def controle(cx, contours, roi):
         velocidade_base = VEL_BASE
         velL = np.clip(velocidade_base + ajuste, config.VEL_MIN, config.VEL_MAX)
         velR = np.clip(velocidade_base - ajuste, config.VEL_MIN, config.VEL_MAX)
-    if config.angulo_y() >= -3 and contador_gangorra == 2:
+    if  contador_gangorra == 2 and config.angulo_y() > -5:
         print("descendo gangorra ")
         contador_gangorra = 1
-        config.mover(-10, -10)
+        config.mover(-2, -2)
         time.sleep(1.0)
         config.mover(-40, -40)
         time.sleep(0.1)
-        config.mover(-10, -10)
+        config.mover(2, 2)
         time.sleep(1.0)
         velocidade_base = 20
         velL = velocidade_base + ajuste
         velR = velocidade_base - ajuste
+        
     
     config.mover(velL, velR)
     ultimo_erro = erro

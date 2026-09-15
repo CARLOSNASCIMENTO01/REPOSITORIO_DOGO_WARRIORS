@@ -47,15 +47,17 @@ def desvio():
         config.mover(-2, -2)
         time.sleep(0.1)
         if config.distancia_frente() <= 5:
+            # Sinaliza visualmente que achou o obstaculo - garra sobe 20
+            # graus e volta pro mesmo lugar de antes (nao fixo em 90, pra
+            # nao mudar a posicao real dela se estiver em outro angulo).
+            
+
             config.mover(18, 18)
             config.mover(-18, -18)
             time.sleep(0.2)
             config.mover(-2, -2)
             time.sleep(0.1)
-            """config.mover(15, -15)
-            time.sleep(1.4)
-            config.mover(-2, 2)
-            time.sleep(0.1)"""
+            
             movimentos_bases.guinada2("D", 96, 14)
             time.sleep(0.2)
 
@@ -147,3 +149,10 @@ def desvio():
             time.sleep(0.9)
             config.mover(0, 0)
             time.sleep(0.8)
+            angulo_pesado_atual = getattr(config.mover_servo, "_angulo_atual", {}).get(
+                config.PINO_PESADO, config.ANGULO_INICIAL
+            )
+            for _ in range(2):
+                config.mover_servo(config.PINO_PESADO, 90)
+                config.mover_servo(config.PINO_PESADO, angulo_pesado_atual)
+

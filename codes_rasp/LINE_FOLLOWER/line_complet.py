@@ -1397,7 +1397,7 @@ def controle(cx, contours, roi):
         velocidade_base = VEL_BASE
         velL = np.clip(velocidade_base + ajuste, VEL_MIN, VEL_MAX)
         velR = np.clip(velocidade_base - ajuste, VEL_MIN, VEL_MAX)
-    if angulo_y() >= -3 and contador_gangorra == 2:
+    """if angulo_y() >= -3 and contador_gangorra == 2:
         print("descendo gangorra ")
         contador_gangorra = 1
         mover(-10, -10)
@@ -1406,7 +1406,7 @@ def controle(cx, contours, roi):
         time.sleep(0.6)
         velocidade_base = 20
         velL = velocidade_base + ajuste
-        velR = velocidade_base - ajuste
+        velR = velocidade_base - ajuste"""
     mover(velL, velR)
     ultimo_erro = erro
 

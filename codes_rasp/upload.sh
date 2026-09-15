@@ -15,6 +15,6 @@ echo "?? Liberando serial..."
 sudo killall python3 2>/dev/null
 
 echo "?? Enviando c�digo..."
-arduino-cli upload -p $PORT --fqbn arduino:avr:nano:cpu=atmega328old ~/OPENCV_LINE/codigo_arduino
+arduino-cli upload -p $PORT --fqbn arduino:avr:nano:cpu=atmega328old /home/pi/ROBO_DOGO_2026/codigo_arduino
 
 echo "? Upload finalizado!"
