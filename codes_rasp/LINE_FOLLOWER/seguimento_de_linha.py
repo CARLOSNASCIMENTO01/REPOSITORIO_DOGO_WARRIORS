@@ -15,9 +15,9 @@ import movimentos_bases
 # =========================================================================
 # VISAO DA LINHA
 # =========================================================================
-LIMIAR   = 80
+LIMIAR   = 80 #80
 AREA_MIN = 10000 # 11000
-kernal = np.ones((3, 3), np.uint8)
+kernal = np.ones((3, 3), np.uint8) #3
 
 _trav_frame_ref = None
 _trav_tempo_ref = time.time()
@@ -111,8 +111,8 @@ def limpar_camera(n=5):
 # CONTROLE (segue linha) - PID
 # =========================================================================
 Kp = 0.9 #0.9
-Kd = 0.4 # 0.27
-VEL_BASE =20 #20
+Kd = 0.4 # 0.6
+VEL_BASE =25 #20
 DEADZONE = 0 # 8, 0
 ALPHA = 0.5  # filtro passa-baixa (EMA) do erro - peso do erro novo, (1-ALPHA) fica com o erro anterior
 LIMIAR_PIXELS_PRETO_GIRO = 21000  # so gira 180 no controle() se pixels_preto_ref passar disso
@@ -167,8 +167,8 @@ def controle(cx, contours, roi):
     if config.angulo_y() <= -10:
         contador_gangorra = 2
         velocidade_base = 28
-        velL = np.clip(velocidade_base + ajuste, config.VEL_MIN, config.VEL_MAX)
-        velR = np.clip(velocidade_base - ajuste, config.VEL_MIN, config.VEL_MAX)
+        velL = np.clip(velocidade_base + ajuste, 0,80)
+        velR = np.clip(velocidade_base - ajuste, 0, 80)
     elif pixels_verde_ctrl > 10000:
         print(f"[VERDE-CONTROLE] pixels_verde={pixels_verde_ctrl} - freando")
         
