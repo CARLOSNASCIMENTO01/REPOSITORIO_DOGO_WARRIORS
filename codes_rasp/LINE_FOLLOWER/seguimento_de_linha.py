@@ -53,6 +53,78 @@ def gap_debug(contours):
     return False
 
 
+# Debug: quando entra no gap (so sobra a ponta final da linha antes dela
+# sumir de vista), pausa TUDO e so fica printando o angulo dessa ponta em
+# relacao ao robo - pra calibrar olhando o valor ao vivo, sem o robo se
+# mexer/reagir. True liga, False desliga (deixar False fora de calibracao,
+# senao o robo trava ali toda vez que entrar na sala de resgate de verdade).
+DEBUG_ANGULO_GAP = False
+
+
+ALONGAMENTO_MIN_ANGULO_GAP = 1.5  # contorno precisa ser pelo menos isso mais comprido que largo pra confiar no angulo
+
+
+def angulo_linha_gap(contours):
+    """So debug - NAO usa isso pra corrigir nada sozinho. Angulo (graus,
+    em relacao a vertical do frame) do maior contorno visto - no gap, esse
+    contorno e a ponta final da linha antes dela sumir. 0 = a ponta ta reta
+    (robo alinhado com o gap); positivo/negativo = torto pra um lado ou
+    outro. None se nao tiver contorno, ou se ele for curto/redondo demais
+    pra ter uma orientacao confiavel (fitLine em blob quase circular da
+    numero sem sentido, pulando entre valores toda hora)."""
+    if not contours:
+        return None
+    maior = max(contours, key=cv2.contourArea)
+
+    (_, _), (larg, alt), _ = cv2.minAreaRect(maior)
+    maior_lado = max(larg, alt)
+    menor_lado = max(min(larg, alt), 1.0)
+    if maior_lado / menor_lado < ALONGAMENTO_MIN_ANGULO_GAP:
+        return None
+
+    vx, vy, _, _ = cv2.fitLine(maior, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+    angulo = float(np.degrees(np.arctan2(float(vx), float(vy))))
+
+    # Linha nao tem "lado" - fitLine pode devolver o vetor apontando pro
+    # sentido oposto (mesma inclinacao real, sinal invertido), o que fazia
+    # o angulo pular entre ~2 e ~178/-178 sem motivo. Dobra pra (-90, 90],
+    # que representa a MESMA orientacao de forma unica.
+    if angulo > 90:
+        angulo -= 180
+    elif angulo <= -90:
+        angulo += 180
+    return angulo
+
+
+VELOCIDADE_ALINHAR_NA_LINHA = 14  # vel da guinada de correcao - mesmo esquema do alinhador de gap, mas independente dele
+
+
+def alinhar_robo_na_linha():
+    """Funcao independente (nao ligada ao fluxo do gap) - tira uma foto,
+    mede o angulo da linha vista (angulo_linha_gap) e corrige com uma
+    guinada bem lenta pra deixar o robo reto em relacao a ela: angulo > 0
+    gira esquerda, angulo < 0 gira direita. So pra chamar manualmente (ex:
+    testar sozinha no main.py) - devolve o angulo corrigido, ou None se nao
+    deu pra medir (sem frame, ou contorno pouco alongado pra confiar)."""
+    ret, frame = config.cap.read()
+    if not ret:
+        print("[ALINHAR] Sem frame da camera")
+        return None
+
+    _, contours, _, _ = visao(frame)
+    angulo = angulo_linha_gap(contours)
+    if angulo is None:
+        print("[ALINHAR] Angulo nao confiavel (contorno pouco alongado), sem corrigir")
+        return None
+
+    print(f"[ALINHAR] Corrigindo angulo={angulo:.1f} graus")
+    if angulo > 0:
+        movimentos_bases.guinada2('E', abs(angulo), VELOCIDADE_ALINHAR_NA_LINHA)
+    elif angulo < 0:
+        movimentos_bases.guinada2('D', abs(angulo), VELOCIDADE_ALINHAR_NA_LINHA)
+    return angulo
+
+
 def detectar_travamento(roi):
     global _trav_frame_ref, _trav_tempo_ref
     LIMIAR_DIFF = 8
@@ -110,11 +182,11 @@ def limpar_camera(n=5):
 # =========================================================================
 # CONTROLE (segue linha) - PID
 # =========================================================================
-Kp = 0.9 #0.9
-Kd = 0.4 # 0.6
-VEL_BASE =25 #20
+Kp = 0.9#0.9 #1.1
+Kd = 0.5 # 0.4 #1.1
+VEL_BASE =15 #20
 DEADZONE = 0 # 8, 0
-ALPHA = 0.5  # filtro passa-baixa (EMA) do erro - peso do erro novo, (1-ALPHA) fica com o erro anterior
+ALPHA = 0.4  # filtro passa-baixa (EMA) do erro - peso do erro novo, (1-ALPHA) fica com o erro anterior
 LIMIAR_PIXELS_PRETO_GIRO = 21000  # so gira 180 no controle() se pixels_preto_ref passar disso
 
 contador_gangorra = 0
@@ -172,17 +244,29 @@ def controle(cx, contours, roi):
     elif pixels_verde_ctrl > 10000:
         print(f"[VERDE-CONTROLE] pixels_verde={pixels_verde_ctrl} - freando")
         
-        velocidade_base = 12
+        velocidade_base = 10
         velL = np.clip(velocidade_base + ajuste, -13, 13)
         velR = np.clip(velocidade_base - ajuste, -13, 13)
         if pixels_verde_ctrl > 24000:
-            # So pixel preto agora - sem check_black/apos_linha_preta (nao
-            # funcionava direito). 24000 de verde + mais de
-            # LIMIAR_PIXELS_PRETO_GIRO de preto = gira 180.
-            roi_h_ref, _ = roi.shape[:2]
+            # Recua ANTES de verificar, e so DEPOIS tira uma foto nova pra
+            # decidir - com duas placas verdes proximas (par do marcador de
+            # 180) o pixel preto medido em cima do roi antigo (de quando
+            # ainda estava colado no marcador) saia errado/ambiguo. Decisao
+            # agora e sempre em cima de uma vista fresca, ja recuada, nao
+            # do roi velho de antes de mexer.
+            config.mover(-2, -2)
+            time.sleep(0.3)
+            config.parar()
+
+            ret_ref, frame_ref = config.cap.read()
+            roi_ref = roi
+            if ret_ref:
+                _, _, roi_ref, _ = visao(frame_ref)
+
+            roi_h_ref, _ = roi_ref.shape[:2]
             corte_top_ref = int(roi_h_ref * 0.4)
-            black_ref = cv2.inRange(roi, black_min, black_max_bot)
-            black_ref[:corte_top_ref, :] = cv2.inRange(roi[:corte_top_ref, :], black_min, black_max_top)
+            black_ref = cv2.inRange(roi_ref, black_min, black_max_bot)
+            black_ref[:corte_top_ref, :] = cv2.inRange(roi_ref[:corte_top_ref, :], black_min, black_max_top)
             black_ref = cv2.dilate(black_ref, kernal, iterations=3)
             black_ref = cv2.erode(black_ref, kernal, iterations=2)
             pixels_preto_ref = cv2.countNonZero(black_ref)
@@ -192,14 +276,10 @@ def controle(cx, contours, roi):
                 print(f"[VERDE-CONTROLE] pixels_preto={pixels_preto_ref} <= {LIMIAR_PIXELS_PRETO_GIRO}, ignorando giro")
             else:
                 print("gira 180")
-
-                config.mover(-2, -2)
+                #movimentos_bases.guinada_absoluta_alinhada("D", 174, 16)
+                config.mover(20, 20)
                 time.sleep(0.3)
-                movimentos_bases.guinada2("D", 170, 20)
-                config.mover(15, 15)
-                time.sleep(0.22)
-                config.mover(-2, -2)
-                time.sleep(0.2)
+               
                 config.parar()
                 limpar_camera(10)
         """if pixels_verde_ctrl > 22000:
@@ -267,6 +347,13 @@ black_max_bot = np.array([91, 91, 91]) #135, 135, 135
 MIN_GREEN_AREA = 1500 #2500
 LIMIAR_PIXELS_VERDE_OUTRO_LADO = 1500  # verde do lado oposto acima disso = pode ser o 2o marcador do 180 comecando a aparecer
 
+# Recuo unico ao entrar num marcador verde nessa faixa de pixel - so uma vez
+# por marcador, nao repete enquanto o MESMO verde continuar visivel.
+LIMIAR_PIXELS_VERDE_RECUO_MIN = 10000 #12000
+LIMIAR_PIXELS_VERDE_RECUO_MAX = 20000
+VEL_RECUO_VERDE = 22 #16
+TEMPO_RECUO_VERDE = 0.2 #0.1
+
 DEBUG_VERDE = True
 DEBUG_SEM_ACAO = False
 PREVIEW_VERDE_EVERY_N = 3
@@ -275,6 +362,7 @@ contador_direita = 0
 contador_esquerda = 0
 contador_180 = 0
 _preview_verde_contador = 0
+_verde_recuo_feito = False
 
 
 def resetar_estado():
@@ -283,6 +371,7 @@ def resetar_estado():
     global _trav_frame_ref, _trav_tempo_ref
     global contador_gangorra, ultimo_erro, ultimo_tempo
     global contador_direita, contador_esquerda, contador_180, _preview_verde_contador
+    global _verde_recuo_feito
 
     _trav_frame_ref = None
     _trav_tempo_ref = time.time()
@@ -295,6 +384,7 @@ def resetar_estado():
     contador_esquerda = 0
     contador_180 = 0
     _preview_verde_contador = 0
+    _verde_recuo_feito = False
 
 
 def check_black(black_around_sign, i, green_box, black_image):
@@ -453,7 +543,29 @@ def mostrar_preview_verde(roi):
     cv2.waitKey(1)
 
 
+def _pixels_verde_roi(roi):
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    green_image = cv2.inRange(hsv, green_min, green_max)
+    green_image = cv2.dilate(green_image, kernal, iterations=3)
+    green_image = cv2.erode(green_image, kernal, iterations=2)
+    return cv2.countNonZero(green_image)
+
+
 def verde(roi):
+    global _verde_recuo_feito
+
+    pixels_verde_atual = _pixels_verde_roi(roi)
+    if pixels_verde_atual == 0:
+        # Verde sumiu de vista - destrava o recuo pra poder disparar de novo
+        # no PROXIMO marcador (nao repete no mesmo enquanto ele continuar visivel).
+        _verde_recuo_feito = False
+    elif not _verde_recuo_feito and LIMIAR_PIXELS_VERDE_RECUO_MIN < pixels_verde_atual < LIMIAR_PIXELS_VERDE_RECUO_MAX:
+        print(f"[VERDE-RECUO] pixels_verde={pixels_verde_atual} entre {LIMIAR_PIXELS_VERDE_RECUO_MIN} e {LIMIAR_PIXELS_VERDE_RECUO_MAX}, recuando uma vez")
+        config.mover(-VEL_RECUO_VERDE, -VEL_RECUO_VERDE)
+        time.sleep(TEMPO_RECUO_VERDE)
+        config.parar()
+        time.sleep(0.05)
+        _verde_recuo_feito = True
 
     acao_verde = detectar_verde(roi)
     if not acao_verde:
@@ -465,14 +577,15 @@ def verde(roi):
 
     if acao_verde == "ESQUERDA":
         print("verde_esquerda")
+        _verde_recuo_feito = False
         config.mover(-2, -2)
         time.sleep(0.2)
         config.mover(15, 15)
         time.sleep(0.3)
         config.parar()
-        movimentos_bases.guinada2('E', 85, 20)
+        movimentos_bases.guinada2('E', 86, 16)
         config.mover(15, 15)
-        time.sleep(0.3)
+        time.sleep(0.2)
         config.mover(-2, -2)
         time.sleep(0.1)
         inicio = time.time()
@@ -486,6 +599,7 @@ def verde(roi):
 
     elif acao_verde == "DIREITA":
         print("verde_direita")
+        _verde_recuo_feito = False
         limpar_camera(10)
         config.mover(-2, -2)
         time.sleep(0.2)
@@ -494,9 +608,11 @@ def verde(roi):
         config.mover(-2, -2)
         time.sleep(0.1)
         config.parar()
-        movimentos_bases.guinada2('D', 85, 20)
+        movimentos_bases.guinada2('D', 86, 16)
         config.mover(15, 15)
-        time.sleep(0.3)
+        time.sleep(0.2)
+        config.mover(-2, -2)
+        time.sleep(0.1)
         inicio = time.time()
         while time.time() - inicio < 1.0:
             config.checar_parada()
@@ -508,11 +624,10 @@ def verde(roi):
 
     elif acao_verde == "GIRAR_180":
         print("gira 180")
-        config.mover(-2, -2)
-        time.sleep(0.3)
-        movimentos_bases.guinada2("D", 170, 20)
-        config.mover(15, 15)
-        time.sleep(0.22)
+        
+        #movimentos_bases.guinada2("D", 174, 16)
+        config.mover(19, 19)
+        time.sleep(1.5)
         config.mover(-2, -2)
         time.sleep(0.2)
         config.parar()

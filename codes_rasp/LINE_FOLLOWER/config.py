@@ -302,6 +302,10 @@ def reiniciar_processo():
     except Exception as e:
         print(f"[RECONEXAO][ERRO] Falha ao parar motores antes de reiniciar: {e}")
     try:
+        parar_gravacao_percurso()
+    except Exception as e:
+        print(f"[RECONEXAO][ERRO] Falha ao parar gravacao antes de reiniciar: {e}")
+    try:
         if cap is not None:
             cap.release()
     except Exception as e:
@@ -817,26 +821,70 @@ def resetar_usb_camera(video_path_ou_indice):
 CAMERA_LINHA_PATH  = "/dev/v4l/by-id/usb-Jieli_Technology_USB_Composite_Device-video-index0"
 CAMERA_LINHA_INDEX_FALLBACK  = 0
 CAMERA_VITIMA_INDEX_FALLBACK = 2  # so pra nunca "roubar" esse indice na varredura abaixo
+CAMERA_VITIMA_PATH = "/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0"  # mesma string de resgate_de_vitimas.py - usada so pra NUNCA roubar essa camera no fallback abaixo
 
 camera_x = 160
 camera_y = 120
 
 USB_RESET_TENTATIVAS_ANTES_DE_RESETAR = 3  # falhas seguidas antes de tentar resetar USB
 
+# So "ret=True" no read() nao basta - depois de um reconnect/reset USB o
+# device pode abrir e ler frame "com sucesso" mas entregar imagem toda
+# preta/travada (interface errada, sensor ainda nao assentou, etc.) - o
+# robo aceitava essa camera como valida e andava cego, ignorando a linha
+# achando que era gap o tempo todo. frame.std() de uma imagem preta/
+# uniforme fica ~0; qualquer cena real (mesmo escura) tem variacao de
+# pixel bem maior que isso.
+LIMIAR_DESVIO_FRAME_VALIDO = 3.0
+
 cap = None  # atribuido por iniciar_camera()
 
 
 def abrir_camera_generica(fonte):
-    """Helper generico de abertura (tenta ler um frame antes de aceitar) -
-    usado tanto pra camera de linha (detectar_camera abaixo) quanto pra
-    camera de vitima (resgate_de_vitimas.py)."""
+    """Helper generico de abertura - usado tanto pra camera de linha
+    (detectar_camera abaixo) quanto pra camera de vitima
+    (resgate_de_vitimas.py). Nao aceita so por ret=True - se a leitura deu
+    certo mas o frame vier preto/travado, tenta mais algumas vezes (a
+    primeira leitura as vezes ainda vem preta mesmo em camera boa, por
+    sensor ainda assentando) e so aceita se algum frame tiver variacao
+    real de pixel (ver LIMIAR_DESVIO_FRAME_VALIDO). Se a leitura FALHAR
+    (ret=False), desiste na hora - nao insiste 3x numa fonte que nem
+    consegue ler, isso so triplicava o tempo de timeout em fonte morta."""
     cap_local = cv2.VideoCapture(fonte, cv2.CAP_V4L2)
     if cap_local.isOpened():
-        ret, _ = cap_local.read()
-        if ret:
-            return cap_local
+        for _ in range(3):
+            ret, frame = cap_local.read()
+            if not ret:
+                break
+            if frame is not None and frame.std() > LIMIAR_DESVIO_FRAME_VALIDO:
+                return cap_local
         cap_local.release()
     return None
+
+
+def _resolver_dev_real(fonte):
+    """Resolve indice/path pro /dev/videoN real por tras (segue symlink de
+    by-id). None se nao existir/nao conseguir resolver."""
+    if isinstance(fonte, int):
+        fonte = f"/dev/video{fonte}"
+    try:
+        return os.path.realpath(fonte)
+    except Exception:
+        return None
+
+
+def _e_camera_de_vitima(fonte):
+    """True se `fonte` (indice ou path) resolve pro MESMO dispositivo
+    fisico da camera de vitima/resgate. Um indice fixo reservado
+    (CAMERA_VITIMA_INDEX_FALLBACK) sozinho nao basta - a ordem de
+    enumeracao USB NAO e fixa entre reconexoes (ja vimos ela mudar na
+    pratica), entao o indice "reservado" podia apontar pra outra coisa e
+    deixar a varredura "roubar" a camera de vitima mesmo assim sem
+    perceber - comparando o /dev/videoN real resolvido agora, nao um
+    numero decorado, isso nao acontece mais."""
+    alvo = _resolver_dev_real(fonte)
+    vitima = _resolver_dev_real(CAMERA_VITIMA_PATH)
+    return alvo is not None and alvo == vitima
 
 
 def detectar_camera():
@@ -846,17 +894,20 @@ def detectar_camera():
             print(f"[Camera] Linha conectada em {CAMERA_LINHA_PATH}")
             return c
 
-    c = abrir_camera_generica(CAMERA_LINHA_INDEX_FALLBACK)
-    if c is not None:
-        print(f"[Camera] Linha conectada no indice {CAMERA_LINHA_INDEX_FALLBACK}")
-        return c
+    if not _e_camera_de_vitima(CAMERA_LINHA_INDEX_FALLBACK):
+        c = abrir_camera_generica(CAMERA_LINHA_INDEX_FALLBACK)
+        if c is not None:
+            print(f"[Camera] Linha conectada no indice {CAMERA_LINHA_INDEX_FALLBACK}")
+            return c
+    else:
+        print(f"[Camera][AVISO] Indice {CAMERA_LINHA_INDEX_FALLBACK} e a camera de vitima agora (enumeracao mudou) - pulando")
 
-    # Ultimo recurso: varre indices, mas NUNCA aceita o indice reservado pra
-    # camera de vitima - senao a busca da camera de linha pode "roubar" a
-    # camera de vitima sem perceber (ela abre e le frame normal, so que da
-    # camera errada), e o robo anda reto sem enxergar a linha.
+    # Ultimo recurso: varre indices, mas NUNCA aceita o dispositivo real da
+    # camera de vitima - comparando o /dev/videoN de verdade (nao so um
+    # indice fixo), ja que a enumeracao USB pode mudar a ordem entre
+    # reconexoes e um numero decorado deixa de proteger nada.
     for i in range(10):
-        if i == CAMERA_VITIMA_INDEX_FALLBACK:
+        if _e_camera_de_vitima(i):
             continue
         c = abrir_camera_generica(i)
         if c is not None:
@@ -882,3 +933,104 @@ def iniciar_camera():
     cap_local.set(4, camera_y)
     cap = cap_local
     return cap_local
+
+
+# =========================================================================
+# GRAVACAO DO PERCURSO (camera da frente/resgate)
+# =========================================================================
+# Liga/desliga com GRAVAR_PERCURSO no topo do main.py. Grava com uma captura
+# PROPRIA (separada de cap/cap_vitima) so pra isso - so seguro chamar em
+# processos que nao estejam usando essa camera pra mais nada (o seguidor nao
+# usa; resgate.py, que ja tem essa camera aberta pra bola/triangulo, tem sua
+# PROPRIA logica de gravacao por cima do cap dele, sem abrir uma segunda
+# captura concorrente no mesmo dispositivo).
+#
+# Cada trecho do percurso (seguidor, resgate) vira um .mp4 separado dentro de
+# video_rounds/, todos com o mesmo prefixo de round - persistido em /tmp
+# (mesma ideia do norte absoluto de movimentos_bases.py: sobrevive a troca de
+# processo via execv, some sozinho quando a Pi reinicia, entao uma rodada nova
+# comeca um round novo).
+CAMERA_FRENTE_RESGATE_PATH = "/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0"
+VIDEO_ROUNDS_DIR = "video_rounds"
+_ARQUIVO_ROUND_VIDEO = "/tmp/robo_dogo_video_round.txt"
+
+_cap_gravacao = None
+_writer_gravacao = None
+_gravando = threading.Event()
+
+
+def id_do_round_video():
+    if os.path.exists(_ARQUIVO_ROUND_VIDEO):
+        try:
+            with open(_ARQUIVO_ROUND_VIDEO) as f:
+                round_id = f.read().strip()
+            if round_id:
+                return round_id
+        except Exception as e:
+            print(f"[GRAVACAO] Falha ao ler round salvo ({e}), gerando novo")
+    round_id = time.strftime("%Y-%m-%d_%H-%M-%S")
+    try:
+        with open(_ARQUIVO_ROUND_VIDEO, "w") as f:
+            f.write(round_id)
+    except Exception as e:
+        print(f"[GRAVACAO] Falha ao salvar round ({e})")
+    return round_id
+
+
+def _proximo_nome_video(round_id, sufixo):
+    n = 1
+    while True:
+        caminho = os.path.join(VIDEO_ROUNDS_DIR, f"{round_id}_{sufixo}_{n}.mp4")
+        if not os.path.exists(caminho):
+            return caminho
+        n += 1
+
+
+def _loop_gravacao():
+    while _gravando.is_set():
+        ret, frame = _cap_gravacao.read()
+        if ret:
+            _writer_gravacao.write(frame)
+        else:
+            time.sleep(0.05)
+
+
+def iniciar_gravacao_percurso(ativado, sufixo="seguidor"):
+    global _cap_gravacao, _writer_gravacao
+    if not ativado:
+        return
+    try:
+        os.makedirs(VIDEO_ROUNDS_DIR, exist_ok=True)
+        caminho = _proximo_nome_video(id_do_round_video(), sufixo)
+        cap_local = cv2.VideoCapture(CAMERA_FRENTE_RESGATE_PATH, cv2.CAP_V4L2)
+        if not cap_local.isOpened():
+            print(f"[GRAVACAO] Nao consegui abrir a camera de resgate ({CAMERA_FRENTE_RESGATE_PATH}) pra gravar")
+            return
+        largura = int(cap_local.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
+        altura = int(cap_local.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+        writer_local = cv2.VideoWriter(caminho, cv2.VideoWriter_fourcc(*"mp4v"), 20.0, (largura, altura))
+        _cap_gravacao = cap_local
+        _writer_gravacao = writer_local
+        _gravando.set()
+        Thread(target=_loop_gravacao, daemon=True).start()
+        print(f"[GRAVACAO] Gravando percurso em {caminho}")
+    except Exception as e:
+        print(f"[GRAVACAO][ERRO] Falha ao iniciar gravacao: {e}")
+
+
+def parar_gravacao_percurso():
+    global _cap_gravacao, _writer_gravacao
+    _gravando.clear()
+    time.sleep(0.15)
+    try:
+        if _writer_gravacao is not None:
+            _writer_gravacao.release()
+    except Exception:
+        pass
+    try:
+        if _cap_gravacao is not None:
+            _cap_gravacao.release()
+    except Exception:
+        pass
+    _writer_gravacao = None
+    _cap_gravacao = None

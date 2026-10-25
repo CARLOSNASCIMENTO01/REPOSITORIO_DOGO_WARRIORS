@@ -1,18 +1,11 @@
-"""
-Pagina em branco pra programar a saida nova, dentro do proprio seguidor de
-linha (nao mexe no resgate.py). Ver REFERENCIA_HARDWARE.py pro que da pra
-usar de config.py/movimentos_bases.py/seguimento_de_linha.py/
-obstaculos_trajeto.py.
 
-Pra ligar isso no robo de verdade: chama minha_saida() de dentro do
-loop_principal() do main.py, no ponto que fizer sentido pro seu fluxo
-(mesmo jeito que obstaculos_trajeto.desvio() ja e chamado hoje).
-"""
-
+import os
+import sys
 import threading
 import time
 
 import cv2
+import lgpio
 
 import config
 import movimentos_bases
@@ -22,11 +15,19 @@ import seguimento_de_linha
 def minha_saida():
     config.mover_servo(config.PINO_PESADO, 130)
 
-    # try/finally - a placa Yahboom mantem o ultimo PWM mandado ate alguem
-    # avisar o contrario. Sem isso, um Ctrl+C (ou RoboParado, ou qualquer
-    # erro) no meio do while deixa o robo andando sozinho com o ultimo
-    # comando, porque config.parar() nunca seria chamado.
     try:
+        #movimentos_bases.guinada2('D', 80, 15)
+        while True:
+            config.mover(-15,15)
+            if config.distancia_frente() < 80:
+
+                break
+                
+        config.mover(28,30)
+        time.sleep(4.0)
+        config.mover(-15,-15)
+        time.sleep(0.5)
+        movimentos_bases.guinada2('D', 85, 15)
         while True:
             config.checar_parada()
 
@@ -49,43 +50,31 @@ def minha_saida():
                 pixels_pretos = 0
             print(f"pixels_pretos={pixels_pretos}")
 
-            """if frente < 9 :
-                config.mover(19, -19)
-                time.sleep(1.0)
-            else:
-                config.mover(15, 20)
-            time.sleep(0.02)
-            if frente > 50 and esquerda > 50:
-                if pixels_pretos > 20000:
-                    print("muito pixel preto")
-                else :
-                    config.mover(19, -19)
-                    time.sleep(1.5)
-            else:
-                config.mover(15, 20)
-            time.sleep(0.02)"""
+            
             config.mover(16, 16)
             print(config.angulo_z())
             if frente < 9 :
+                print("paredeeee")
                 config.resetar_giroscopio()
                 angulozero = config.angulo_z()
                 config.mover(30, 30)
                 time.sleep(1.5)
                 if (config.angulo_z() - angulozero) < -20:
                     movimentos_bases.guinada2('D', 86, 15)
-                    config.mover(15, 15)
+                    config.mover(19, 19)
                     time.sleep(0.9)
-                    movimentos_bases.guinada2('D', 45, 15)
+                    movimentos_bases.guinada2('D', 40, 15)
                 else:
                     config.mover(-15, -15)
                     time.sleep(0.7)
                     movimentos_bases.guinada2('D', 84, 15)
             
-            if 18000 < pixels_pretos < 26000:
+            if 24000 < pixels_pretos < 28000:
+                print("saida frente")
                 config.mover(-15,-15)
                 time.sleep(0.2)
                 inicio_frente = time.time()
-                while pixels_pretos <= 28000 and time.time() - inicio_frente <= 0.9:
+                while pixels_pretos <= 29000 and time.time() - inicio_frente <= 0.9:
                     config.checar_parada()
                     config.mover(15, 15)
                     ret2, frame2 = config.cap.read()
@@ -95,15 +84,30 @@ def minha_saida():
                     time.sleep(0.02)
                 config.parar()
                 print("pixels_pretos=", pixels_pretos)
-                if pixels_pretos > 27000:
+                if pixels_pretos >= 29000:
                     print("saiiiiiii")
+                    config.mover(15,15)
+                    time.sleep(0.9)
+                    movimentos_bases.guinada2('E', 20, 15)
                     time.sleep(2.0)
-                    return 0
+                    config.parar()
+                    config.cap.release()
+                    lgpio.gpiochip_close(config.h)
+                    os.execv(sys.executable, [
+                        sys.executable,
+                        "/home/pi/ROBO_DOGO_2026/codes_rasp/LINE_FOLLOWER/main.py",
+                        "--auto",
+                        f"--entregas={config.ENTREGAS_HERDADAS}",
+                    ])
+
                 else:
                     config.mover(-15,-15)
-                    time.sleep(2.5)
+                    time.sleep(2.0)
                     movimentos_bases.guinada2('D', 86, 15)
+                    config.mover(18,18)
+                    time.sleep(1.2)
             if esquerda > 40:
+                print("buracooooo")
                 config.mover(-2,-2)
                 time.sleep(0.4)
                 config.mover(15,15)
@@ -111,7 +115,7 @@ def minha_saida():
                 movimentos_bases.guinada2('E', 86, 15)
                 
                 inicio_frente = time.time()
-                while pixels_pretos <= 28000 and time.time() - inicio_frente <= 1.9:
+                while pixels_pretos <= 30000 and time.time() - inicio_frente <= 2.1:
                     config.checar_parada()
                     config.mover(15, 15)
                     ret2, frame2 = config.cap.read()
@@ -123,52 +127,49 @@ def minha_saida():
                 print("pixels_pretos=", pixels_pretos)
                 if pixels_pretos > 29000:
                     print("saiiiiiii")
+                    config.mover(15,15)
+                    time.sleep(0.9)
+                    movimentos_bases.guinada2('E', 20, 15)
                     time.sleep(2.0)
-                    return 0
+                    config.parar()
+                    config.cap.release()
+                    lgpio.gpiochip_close(config.h)
+                    os.execv(sys.executable, [
+                        sys.executable,
+                        "/home/pi/ROBO_DOGO_2026/codes_rasp/LINE_FOLLOWER/main.py",
+                        "--auto",
+                        f"--entregas={config.ENTREGAS_HERDADAS}",
+                    ])
+
                 else:
-                    
+
                     config.mover(-15,-15)
                     time.sleep(1.4)
                     movimentos_bases.guinada2('D', 86, 15)
                     if config.distancia_frente() < 15:
                         config.mover(-15,-15)
-                        time.sleep(0.5)
+                        time.sleep(0.3)
                         movimentos_bases.guinada2('D', 86, 15)
                         
-                    config.mover(15,15)
-                    time.sleep(1.3)
+                    config.mover(18,18)
+                    time.sleep(1.2)
                 
     finally:
         config.parar()
 
 
 if __name__ == "__main__":
-    # Rodando esse arquivo sozinho (sem passar pelo main.py), ninguem liga a
-    # serial do Arduino - sem isso config.sonar_valido() fica True so por uma
-    # fracao de segundo (o valor inicial do "ultimo_recebimento" la no import
-    # de config.py) e depois vira False pra sempre, travando o loop no
-    # "if not sonar_valido(): continue" sem nunca mais chamar mover().
+    
     config.handshake_serial()
     threading.Thread(target=config.serial_thread, daemon=True).start()
 
-    # Mesma coisa pro giroscopio (BNO055) - iniciar_mpu() reseta o chip e
-    # coloca ele no modo de fusao certo. Sem isso, angulo_z()/guinada2()
-    # (que ja e usada la embaixo) nao tem garantia de funcionar direito.
+
     config.iniciar_mpu()
 
-    # Mesma coisa pra camera de linha (config.cap) - so existe depois de
-    # iniciar_camera(), senao config.cap fica None e o .read() quebra.
     config.iniciar_camera()
 
-    # Ninguem fica lendo o botao fisico por conta propria tambem - precisa
-    # subir a botao_thread() aqui, igual main.py ja faz.
     threading.Thread(target=config.botao_thread, daemon=True).start()
 
-    # E ninguem liga config.robo_ativo sozinho (isso normalmente e o botao
-    # quem faz, na primeira ativacao) - sem isso a primeira checar_parada()
-    # ja derruba com RoboParado. Aqui e teste de bancada, entao liga direto;
-    # o primeiro toque no botao a partir daqui vai PAUSAR (ja que comeca
-    # ativo), igual no robo de verdade.
     config.robo_ativo.set()
 
     try:

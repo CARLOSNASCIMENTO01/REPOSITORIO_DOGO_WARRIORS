@@ -185,9 +185,6 @@ seguimento_de_linha.controle(cx, contours, roi)
 
 9) OBSTACULO - obstaculos_trajeto.py
 ------------------------------------------------------------------
-obstaculos_trajeto.esperar_obstaculo_frontal_sumir(limiar_cm=15, intervalo=0.05)
-    So usada uma vez no boot (desafio surpresa da largada).
-
 obstaculos_trajeto.desvio()
     Confere o sonar frontal e, se achar obstaculo (<=5cm, so em piso
     plano), executa a manobra de desvio inteira sozinha (contorna pela

@@ -4,7 +4,7 @@ import os
 # Cria a pasta caso não exista
 os.makedirs("fotos_saida", exist_ok=True)
 
-cap = cv2.VideoCapture(0)  # Troque para 1 se sua câmera estiver no índice 1
+cap = cv2.VideoCapture(1)  # Troque para 1 se sua câmera estiver no índice 1
 
 contador = 0
 

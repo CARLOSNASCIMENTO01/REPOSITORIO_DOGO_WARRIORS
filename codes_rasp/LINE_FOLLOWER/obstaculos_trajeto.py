@@ -13,6 +13,8 @@ import seguimento_de_linha
 
 LIMIAR_OBSTACULO_SURPRESA_CM = 15  # desafio surpresa: espera esse obstaculo sumir antes de sair
 
+desviou = 0  # 0 = ainda nao desviou nenhuma vez, >0 = ja desviou - so desvia uma vez, dai so ignora e segue linha
+
 
 def esperar_obstaculo_frontal_sumir(limiar_cm=LIMIAR_OBSTACULO_SURPRESA_CM, intervalo=0.05):
     """
@@ -32,16 +34,19 @@ def esperar_obstaculo_frontal_sumir(limiar_cm=LIMIAR_OBSTACULO_SURPRESA_CM, inte
 
 
 def desvio():
+    global desviou
+
     # Sonar da frente aponta reto: numa rampa/gangorra inclinada o feixe
     # pode bater no proprio chao e ler "parede" que nao existe. So confia
     # nele com o robo em piso plano (mesma faixa que controle() usa pra
     # saber que nao esta na gangorra).
     if not (-5 < config.angulo_y() < 3):
         return
-    if config.distancia_frente() <= 5:
+    if config.distancia_frente() <= 5 and desviou == 0 :
         # O Arduino alterna F/E a cada 60ms, entao cada sonar so atualiza a
         # cada ~120ms. Um sleep menor que isso reconfere o MESMO valor em
         # cache, nao uma leitura nova - por isso 0.15s aqui, nao 0.09s.
+    
         config.mover(-2, -2)
         time.sleep(1.3)
         config.mover(-2, -2)
@@ -58,7 +63,11 @@ def desvio():
             config.mover(-2, -2)
             time.sleep(0.1)
             
-            movimentos_bases.guinada2("D", 96, 14)
+            # Alinhada ao campo (nao so relativa) - evita que o robo fique
+            # torto depois de varios obstaculos, ja que guinada2() sozinha
+            # so gira relativo a onde ele ja estava apontando (acumula o
+            # desvio de andar na pista).
+            movimentos_bases.guinada2("D", 92, 14)
             time.sleep(0.2)
 
             while True:
@@ -143,16 +152,30 @@ def desvio():
             config.mover(-2, 2)
             time.sleep(0.1)"""
             movimentos_bases.guinada2("D", 90, 18)
-            config.mover(-13, -13)
+            config.mover(-15, -15)
+            desviou += 1 
             time.sleep(0.9)
             config.mover(2, 2)
             time.sleep(0.9)
             config.mover(0, 0)
             time.sleep(0.8)
-            angulo_pesado_atual = getattr(config.mover_servo, "_angulo_atual", {}).get(
-                config.PINO_PESADO, config.ANGULO_INICIAL
-            )
-            for _ in range(2):
-                config.mover_servo(config.PINO_PESADO, 90)
-                config.mover_servo(config.PINO_PESADO, angulo_pesado_atual)
+    elif config.distancia_frente() <= 5 and desviou == 1:
+        # Segunda vez que identifica o obstaculo - outra coisa (a definir).
+        
+        config.mover(18, 18)
+        config.mover(-18, -18)
+        time.sleep(0.5)
+        config.mover(-2, -2)
+        time.sleep(0.1)
+        
 
+        movimentos_bases.guinada2("E", 52, 14)
+        config.mover(21, 21)
+        time.sleep(1.65)
+        movimentos_bases.guinada2("E", 28, 14)
+        config.mover(-21, -21)
+        time.sleep(0.3)
+
+
+        time.sleep(0.2)
+        #desviou += 1
