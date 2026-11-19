@@ -1,26 +1,13 @@
-"""
-Identificacao de vitimas (YOLO ONNX numa 2a camera, so aberta durante o
-resgate) e o handoff pro resgate.py quando o seguidor acha a sala (gap
-continuo por tempo demais).
-
-OBS: identificar_vitimas() nao e chamada por area() hoje - a docstring
-promete isso mas o codigo nunca fez essa chamada. Preservado exatamente
-como estava.
-"""
 
 import os
 import sys
 import time
 
 import cv2
+import lgpio
 
 import config
 import movimentos_bases
-# "from ultralytics import YOLO" NAO fica aqui no topo - sozinho ja custa
-# varios segundos (importa o torch inteiro) e travava o boot do seguidor
-# antes de qualquer print, mesmo o modelo de vitima nunca sendo usado nessa
-# execucao. O import so acontece dentro de carregar_modelo_vitima(), que so
-# roda se identificar_vitimas() for chamada de verdade.
 
 CAMERA_VITIMA_PATH = "/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0"
 CAMERA_VITIMA_INDEX_FALLBACK = 2
@@ -70,11 +57,8 @@ def _abrir_camera_vitima():
 
 
 def identificar_vitimas():
-    """Abre a 2a camera, roda a inferencia YOLO em alguns frames e fecha.
-    Retorna lista de deteccoes: [{"classe": str, "conf": float}, ...]
-    Chamada dentro de area() assim que o robo entra na area de resgate."""
     if modelo_vitima is None:
-        carregar_modelo_vitima()  # carregamento preguicoso, so na primeira chamada
+        carregar_modelo_vitima()
 
     if modelo_vitima is None:
         print("[VITIMA] Modelo indisponivel, pulando deteccao")
@@ -154,8 +138,14 @@ def identificar_vitimas():
 
 def area(contours):
     print("estou na area")
-    os.execv(sys.executable, [
-        sys.executable,
-        "/home/pi/ROBO_DOGO_2026/codes_rasp/LINE_FOLLOWER/resgate.py",
-        f"--entregas={config.ENTREGAS_HERDADAS}",
-    ])
+    # Saida ja comecou nessa rodada: vai direto pro minha_saida.py (canto
+    # vermelho + saida), sem refazer o resgate.
+    if os.path.exists(config.ARQUIVO_SAIDA_INICIADA):
+        print("[AREA] Saida ja iniciada, indo direto pro minha_saida.py")
+        script = "/home/pi/ROBO_DOGO_2026/codes_rasp/LINE_FOLLOWER/minha_saida.py"
+    else:
+        script = "/home/pi/ROBO_DOGO_2026/codes_rasp/LINE_FOLLOWER/resgate.py"
+    config.parar()
+    config.cap.release()
+    lgpio.gpiochip_close(config.h)
+    os.execv(sys.executable, [sys.executable, script, f"--entregas={config.ENTREGAS_HERDADAS}"])

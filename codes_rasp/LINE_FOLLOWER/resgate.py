@@ -1,3 +1,9 @@
+import os as _os, sys as _sys
+_VENV_PY = "/home/pi/ROBO_DOGO_2026/env_dogo/bin/python3"
+if "env_dogo" not in _sys.prefix and not _os.environ.get("ROBO_REEXEC") and _os.path.exists(_VENV_PY):
+    _os.environ["ROBO_REEXEC"] = "1"
+    _os.execv(_VENV_PY, [_VENV_PY] + _sys.argv)
+
 import cv2
 import lgpio as GPIO
 import time
@@ -48,16 +54,14 @@ TOLERANCIA_PROPORCAO = 0.8
 AREA_MIN_TRI = 2500 #500 - baixo demais, deixava passar ruido pequeno (blob de ~510px que nao era triangulo nenhum)
 AREA_MAX_TRI = 1000000
 
-# So pra acionar_saida(): area minima maior que o normal, exigindo um blob
-# bem mais confiante antes de aceitar como canto - na saida um falso
-# positivo (sombra/reflexo/vazamento de cor perto da abertura de verdade)
-# custa caro (desvia o robo da saida real), entao vale ser mais rigoroso
-# aqui do que durante a entrega normal (onde o triangulo as vezes ainda
-# esta longe/pequeno e precisa do limiar mais baixo pra ser visto a tempo).
 AREA_MIN_TRI_SAIDA = 6000
 
 STOP_AREA_RATIO_TRIANGULO = 0.80
-TRIANGULO_MAX_GIROS = 90  # passos de turn_right(15)+0.3s por volta de 360 no buscar_triangulo()
+VOLTAS_TRIANGULO_NORMAL = 3  # voltas de 360 (giroscopio) na velocidade normal antes de reposicionar
+VOLTAS_TRIANGULO_LENTO = 1   # depois delas, mais essas voltas de 360 mais devagar, ai sim reposiciona
+VEL_GIRO_TRIANGULO = 16
+VEL_GIRO_TRIANGULO_LENTO = 12
+TEMPO_MAX_VOLTA_TRIANGULO_LENTO = 40.0  # segundos - so na volta lenta: se algo travar o giro e nao completar 360 no giroscopio, desiste dela depois disso
 TRIANGULO_MAX_APPROACH_STEPS = 90
 TRIANGULO_LOST_FRAMES = 15
 TRIANGULO_APPROACH_SPEED = 20
@@ -69,29 +73,22 @@ MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_inox
 CAMERA_INDEX = "/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0"
 CROP_W, CROP_H = 320, 240
 
-# Grava o percurso inteiro com essa mesma camera (o main.py tem a MESMA
-# chave, independente, pro trecho do seguidor) - True liga, False desliga
-# sem apagar codigo. Aqui NAO abre uma segunda captura (a camera ja esta
-# aberta em cap pra bola/triangulo) - so escreve os frames que ja sao lidos
-# normalmente num video_rounds/<round>_resgate_N.mp4, mesmo <round> do
-# main.py (persistido em /tmp, ver config.py/movimentos_bases.py pro mesmo
-# esquema com o norte absoluto).
 GRAVAR_PERCURSO = False
 VIDEO_ROUNDS_DIR = "video_rounds"
 _ARQUIVO_ROUND_VIDEO = "/tmp/robo_dogo_video_round.txt"
 
-# camera de resgate: 70 graus de FOV nominal, capturada em 1280x720 mas
-# center_crop() so usa o centro em 320x240 pra deteccao - ou seja, so 25%
-# da largura capturada. FOV de verdade usado na deteccao (geometria de
-# lente): 2*atan(0.25*tan(35)) ~= 20 graus, bem menor que os 70 nominais.
-# Girar em passos desse tamanho (em vez de tempo fixo/chute) garante que a
-# varredura de 360 graus nao deixa buraco entre um giro e outro.
 GRAUS_POR_PASSO_BUSCA = 20
-MAX_PASSOS_BUSCA_360 = int(360 / GRAUS_POR_PASSO_BUSCA) + 1  # +1 de folga contra deriva do giroscopio
-VARREDURAS_360_ANTES_REPOSICIONAR = 1  # quantas voltas de 360 buscar_bola() da (reposicionando entre elas) antes de desistir
-VARREDURAS_360_TRIANGULO_ANTES_REPOSICIONAR = 2  # idem, mas pra buscar_triangulo() (giro continuo, nao guinada2)
-MAX_TENTATIVAS_BUSCA_FINAL = 3  # quantas "bolas sobrando" a busca final tenta pegar antes de desistir e ir pra saida
+VARREDURAS_360_ANTES_REPOSICIONAR = 2  # quantas voltas de 360 buscar_bola() da (reposicionando entre elas) antes de desistir
+MAX_TENTATIVAS_BUSCA_FINAL = 3
 CONF_THRES = 0.35
+
+MODO_ANTI_BOLA_FALSA = True #MODO BOLAAAAAAAAAA!!!!!!!!
+FILTRO_ALTURA_BOLA = True
+Y2_MIN_BOLA_CHAO = 100
+FILTRO_PARALAXE_BOLA = True
+PARALAXE_CRESCIMENTO_MIN = 1.4  # largura atual / largura inicial pra fazer o teste (chegou bem mais perto)
+PARALAXE_DESCIDA_MIN_PX = 15    # quanto o y2 tem que ter descido (px) nesse tempo
+PARALAXE_MARGEM_BAIXO_PX = 25   # se a caixa ja comecou colada no fundo do crop, nao da pra descer - nao testa
 IMG_CENTER_X = CROP_W // 2
 TOLERANCE = 30
 
@@ -105,39 +102,21 @@ TEMPO_FREIO_YAHBOOM = 0.08
 VEL_MAX = 20
 VEL_MIN = -VEL_MAX
 
-# 3 niveis de aproximacao pela ratio (area da bola / area do crop - quanto
-# menor, mais longe): longe (passo grande, mais tempo, cobre distancia
-# rapido) -> medio (passo atual, "normal") -> perto (passo curto/lento, pra
-# nao passar do ponto certo perto do STOP_AREA_RATIO).
-APPROACH_RATIO_LONGE = 0.15  # abaixo disso e "longe" - usa o passo grande
+APPROACH_RATIO_LONGE = 0.15
 APPROACH_SPEED_LONGE = 45
 APPROACH_STEP_TIME_LONGE = 0.28
 
 APPROACH_SPEED = 30#25
 APPROACH_STEP_TIME = 0.18#0.18
-# Perto do limiar de parada (STOP_AREA_RATIO), pulso maior/velocidade alta
-# facilmente passa do ponto certo - a partir de APPROACH_RATIO_PERTO troca
-# pra passos mais curtos e mais lentos, pra acertar a distancia certinho.
 APPROACH_RATIO_PERTO = 0.5
 APPROACH_SPEED_PERTO = 15
 APPROACH_STEP_TIME_PERTO = 0.08
-STOP_AREA_RATIO = 0.70
+STOP_AREA_RATIO = 0.90
 MAX_APPROACH_STEPS = 60
 
-# Depois de fechar/levantar a garra e recuar (fim da tentativa de pegar),
-# confere de novo se ainda ve uma bola grande na frente - se ver, a garra
-# errou (bola ficou no chao, nao dentro da garra). Calibrar ao vivo - e a
-# area esperada de uma bola no chao logo na frente apos o recuo do final
-# da sequencia de garra (mover(-25,-25) em pegar_e_entregar_bola()).
 LIMIAR_AREA_BOLA_NAO_PEGA = 0.15
-MAX_TENTATIVAS_PEGAR_BOLA = 3  # quantas vezes tenta pegar de novo se a garra errar antes de desistir dessa bola
+MAX_TENTATIVAS_PEGAR_BOLA = 3
 
-# True logo depois do MOVIMENTO de captura (fechar garra), False so depois
-# de entregar_bola() rodar de verdade. Se o robo for comecar a procurar de
-# novo com isso ainda True (fez a captura mas nunca chegou a entregar -
-# seja porque bola_ainda_no_chao() avaliou que errou, seja por qualquer
-# outro motivo), solta a garra ANTES de procurar - defensivo, pra nao
-# ficar carregando uma bola presa por engano enquanto vai atras de outra.
 _garra_com_captura_nao_entregue = False
 LOST_BALL_FRAMES = 8
 TURN_PULSE = 0.2#0.16
@@ -149,18 +128,11 @@ CENTER_TURN_SPEED_MAX = 25
 CENTER_MAX_TENTATIVAS = 15
 CENTER_LOST_FRAMES = 5
 
-# Ordem de entrega: as duas primeiras bolas tem que ser prata, a ultima
-# preta (ver classe_bola_alvo() mais abaixo). MAX_ENTREGAS tava em 0 por
-# engano - com isso, a primeira entrega ja disparava "busca final" e ia
-# direto pra saida depois de UMA bola so, nunca entregando as outras duas.
 QTD_PRATA_ENTREGAS = 2
 QTD_PRETA_ENTREGAS = 1
 MAX_ENTREGAS = QTD_PRATA_ENTREGAS + QTD_PRETA_ENTREGAS
 
-# Regra ASR_2026: se True, ao entregar a vitima MORTA (bola preta) o robo
-# fica parado TEMPO_PAUSA_VITIMA_MORTA_ASR segundos antes de continuar.
-# False desliga a pausa sem precisar apagar o codigo.
-ASR_2026 = True
+ASR_2026 = False
 TEMPO_PAUSA_VITIMA_MORTA_ASR = 180  # 3 minutos
 
 CAMERA_INDEX_LINHA = "/dev/v4l/by-id/usb-Jieli_Technology_USB_Composite_Device-video-index0"
@@ -179,21 +151,10 @@ TOLERANCIA_ANGULO_HORIZONTAL_LINHA = 60 #58  # calibrado ao vivo, era 58
 DIST_LATERAL_ABERTA_CM = 30
 DIST_PAREDE_FRENTE_CM = 10
 
-# codigo_arduino.ino manda exatamente 255.0 quando o eco do ultrassonico nao
-# volta a tempo (pulseIn timeout) OU quando a leitura sai da faixa valida -
-# ou seja, "255" tanto pode ser "nao tem nada por perto" quanto "sensor
-# falhou nessa leitura", sem distincao nenhuma. Isso fazia toda falha de
-# leitura (rotina em sonar ultrassonico perto de parede angulada) ser lida
-# como "lateral aberta" pelo DIST_LATERAL_ABERTA_CM, causando falso positivo
-# ~4 em cada 10 vezes. distancia_frente()/distancia_esquerda() abaixo
-# reconhecem esse 255 explicito e devolvem SONAR_INVALIDO (9999, mesmo
-# sentinela ja usado em dados{} antes do primeiro dado chegar) no lugar -
-# quem checa "lateral aberta" tem que excluir esse valor, nao so comparar
-# ">" com DIST_LATERAL_ABERTA_CM.
 SONAR_INVALIDO = 9999
 LIMIAR_ERRO_SONAR_CM = 254  # >= isso e o "255.0" de erro do firmware (folga de arredondamento)
 
-FRAMES_CONFIRMACAO_LATERAL = 5  # leituras seguidas exigidas antes de confiar que a lateral abriu
+FRAMES_CONFIRMACAO_LATERAL = 5
 
 VEL_SAIDA = 15
 TEMPO_MAX_CONFIRMAR_LATERAL = 1.0
@@ -201,11 +162,6 @@ TEMPO_MAX_CONFIRMAR_LATERAL = 1.0
 USBDEVFS_RESET = 21780
 USB_RESET_TENTATIVAS_ANTES_DE_RESETAR = 3
 
-# So "ret=True" no read() nao basta pra aceitar uma camera - depois de um
-# reconnect/reset USB o device pode abrir e ler frame "com sucesso" mas
-# entregar imagem toda preta/travada (interface errada, sensor ainda nao
-# assentou). frame.std() de uma imagem preta/uniforme fica ~0; qualquer
-# cena real (mesmo escura) tem variacao de pixel bem maior que isso.
 LIMIAR_DESVIO_FRAME_VALIDO = 3.0
 
 BNO_ADDR        = 0x29
@@ -241,7 +197,7 @@ _serial_thread_iniciada = [False]
 
 ALVO_COR = None
 CLASSE_COR_ENTREGA = {}
-CLASSE_POR_NOME = {}  # nome normalizado ("bola-prata"/"bola-preta") -> class_id do modelo
+CLASSE_POR_NOME = {}
 model = None
 
 _gyro_lock = threading.Lock()
@@ -272,12 +228,15 @@ def checar_parada():
         raise RoboParado()
 
 def botao_thread():
-    anterior = 0
+    # Interruptor gangorra: cada virada muda o nivel e ele fica la, entao
+    # qualquer mudanca (0->1 ou 1->0) liga/desliga - igual config.botao_thread.
+    anterior = GPIO.gpio_read(h, BUTTON)
     while True:
         estado = GPIO.gpio_read(h, BUTTON)
-        if estado == 0 and anterior == 1:
-            time.sleep(0.03)
-            if GPIO.gpio_read(h, BUTTON) == 0:
+        if estado != anterior:
+            time.sleep(0.05)  # repique do contato
+            estado = GPIO.gpio_read(h, BUTTON)
+            if estado != anterior:
                 if robo_ativo.is_set():
                     robo_ativo.clear()
                     parar_motores()
@@ -295,8 +254,6 @@ def botao_thread():
                         _angulo_atual[PINO_PESADO] = SERVO_PESADO_ANGULO_ATIVO
                     except Exception as e:
                         print(f"[BOTAO][ERRO] Falha ao levantar servo pesado: {e}")
-                while GPIO.gpio_read(h, BUTTON) == 1:
-                    time.sleep(0.02)
         anterior = estado
         time.sleep(0.02)
 
@@ -311,13 +268,6 @@ def detectar_porta(sair_se_falhar=True):
     except serial.SerialException:
         pass
 
-    # A porta da placa Yahboom (motor_serial) nunca pode ser tambem
-    # escolhida aqui pro Arduino - senao os dois ficam abrindo o MESMO
-    # device concorrentemente (visto ao vivo: PWM do motor falhando com
-    # I/O error e o sonar nunca recebendo dado valido, preso reconectando
-    # em loop). So acontece quando o ID fixo acima falha e cai nas buscas
-    # genericas abaixo, mas vale excluir sempre. Mesma correcao ja aplicada
-    # em config.py:detectar_porta().
     porta_motor = motor_serial.port if motor_serial is not None else None
 
     PALAVRAS_FTDI = ["ftdi", "ft232", "usb serial converter", "ftb6spl3"]
@@ -360,13 +310,6 @@ def aguardar_porta(intervalo=1.0):
     return porta
 
 def _detectar_porta_yahboom(sair_se_falhar=True):
-    """Acha a porta serial da placa Yahboom pelo VID:PID (1a86:7522, CH340
-    generico), nao por um caminho fisico fixo (by-path) - esse caminho e
-    atrelado ao SLOT USB, nao ao dispositivo, entao se a placa mudar de
-    porta um by-path antigo passaria a apontar pra outro device qualquer
-    (ex: o Arduino), que abre serial sem erro nenhum mas nao e a Yahboom -
-    o sintoma seria o robo "conectar" normal e os motores simplesmente nao
-    se mexerem. Mesma correcao ja aplicada em config.py."""
     for p in serial.tools.list_ports.comports():
         if (p.vid, p.pid) == (0x1a86, 0x7522):
             try:
@@ -382,10 +325,6 @@ def _detectar_porta_yahboom(sair_se_falhar=True):
     return None
 
 def _aguardar_porta_yahboom(intervalo=1.0):
-    """Espera a placa Yahboom aparecer em vez de derrubar o processo
-    inteiro se ela nao estiver plugada nesse instante do boot - antes,
-    serial.Serial(YAHBOOM_PORTA, ...) direto no boot crashava o resgate
-    inteiro se a placa nao estivesse pronta bem na hora."""
     porta = _detectar_porta_yahboom(sair_se_falhar=False)
     tentativas = 0
     while porta is None:
@@ -393,9 +332,6 @@ def _aguardar_porta_yahboom(intervalo=1.0):
         print(f"[MOTOR] Placa Yahboom ainda nao apareceu, tentando de novo... ({tentativas})")
         time.sleep(intervalo)
         porta = _detectar_porta_yahboom(sair_se_falhar=False)
-    # CH340/firmware da placa costuma resetar quando a serial e reaberta -
-    # sem essa espera os primeiros $pwm: saem enquanto ela ainda esta
-    # subindo e sao ignorados sem erro nenhum.
     print("[MOTOR] Placa Yahboom encontrada, esperando ela terminar de subir...")
     time.sleep(2.0)
     print("[MOTOR] Pronta")
@@ -488,10 +424,6 @@ def distancia_esquerda():
     return SONAR_INVALIDO if valor >= LIMIAR_ERRO_SONAR_CM else valor
 
 def lateral_aberta():
-    """True so com leitura valida (nao o 255 de erro do firmware) e de
-    verdade acima do limiar - usado com confirmacao em varios frames
-    seguidos (FRAMES_CONFIRMACAO_LATERAL) antes de agir, pra nao reagir a
-    uma falha de leitura isolada do ultrassonico."""
     d = distancia_esquerda()
     return sonar_valido() and DIST_LATERAL_ABERTA_CM < d < SONAR_INVALIDO
 
@@ -499,12 +431,6 @@ def sonar_valido():
     return (time.time() - ultimo_recebimento) < SERIAL_TIMEOUT_DADO
 
 def recuar_ate_ver_parede(vel_recuo=15, timeout=2.0):
-    """Antes de virar pra dentro de uma abertura lateral: recua enquanto o
-    sonar ainda le "aberto" (o robo pode ter avancado ate o pivo de giro
-    ficar no meio do buraco) ate a leitura fechar de novo (parede solida
-    logo atras da abertura) ou estourar o tempo limite. Depois avanca um
-    pouco pra reposicionar antes do guinada2 de virar - assim o giro fica
-    centrado na abertura, nao encostando na quina dela."""
     inicio = time.time()
     while lateral_aberta() and time.time() - inicio < timeout:
         checar_parada()
@@ -729,8 +655,8 @@ def _enviar_pwm_yahboom(m1, m2, m3, m4):
 def aplicar_motor(velL, velR):
     velL = max(min(velL, VEL_MAX), VEL_MIN)
     velR = max(min(velR, VEL_MAX), VEL_MIN)
-    pwm_esq = velL * ESCALA_PWM_YAHBOOM
-    pwm_dir = velR * ESCALA_PWM_YAHBOOM
+    pwm_esq = -velL * ESCALA_PWM_YAHBOOM
+    pwm_dir = -velR * ESCALA_PWM_YAHBOOM
     _enviar_pwm_yahboom(pwm_dir, pwm_esq, pwm_dir, pwm_esq)
 
 def mover(velL, velR):
@@ -813,6 +739,29 @@ def mover_servo(pino, angulo, velocidade=100, pulso_min=500, pulso_max=2500):
     except lgpio.error as e:
         print(f"Falha ao desligar PWM do servo (pino={pino}): {e}")
 
+# Descida da garra pra pegar a bola: abaixo do 0 (pulso < 500us) pra descer
+# mais - testado no controle pelo teclado com -6.
+ANGULO_GARRA_BAIXO = -6
+
+
+def descer_garra_toda():
+    """Desce o servo pesado ate 0 (suave) e depois pro ANGULO_GARRA_BAIXO.
+    O tx_servo do lgpio nao aceita pulso < 500us, entao abaixo de 0 usa PWM de
+    50 Hz. Fica segurando a forca la embaixo ate o proximo mover_servo (que
+    volta pro tx_servo normal)."""
+    mover_servo(PINO_PESADO, 0, velocidade=100)
+    if ANGULO_GARRA_BAIXO >= 0:
+        mover_servo_direto(PINO_PESADO, ANGULO_GARRA_BAIXO, manter_pulso=True)
+        return
+    pulso = 500 + (ANGULO_GARRA_BAIXO / 180.0) * 2000
+    try:
+        lgpio.tx_pwm(h, PINO_PESADO, 50, pulso / 20000 * 100)
+    except lgpio.error as e:
+        print(f"Falha ao descer garra abaixo de 0 (pulso={pulso:.0f}): {e}")
+    _angulo_atual[PINO_PESADO] = 0  # proximo mover_servo parte do 0
+    time.sleep(0.15)
+
+
 def angulo(ang):
     ang = max(0, min(180, ang))
     pulso = int(500 + (2000 * ang / 180))
@@ -887,8 +836,6 @@ def _id_do_round_video():
 _writer_gravacao = None
 
 def iniciar_gravacao_percurso():
-    """So escreve os frames que o cap (ja aberto pra bola/triangulo) ja le
-    de qualquer jeito - NAO abre uma segunda captura na mesma camera."""
     global _writer_gravacao
     if not GRAVAR_PERCURSO:
         return
@@ -932,6 +879,36 @@ def center_crop(frame, crop_w, crop_h):
     x2, y2 = x1 + crop_w, y1 + crop_h
     return frame[y1:y2, x1:x2].copy()
 
+TEMPO_FRAME_PARADO_LEVANTA_GARRA = 3.0  # segundos com a imagem parada (robo travado) pra levantar a garra
+LIMIAR_DIFF_FRAME_PARADO = 5.0  # diferenca media de pixel (0-255) abaixo disso = frame "igual" ao de referencia
+ANGULO_GARRA_LEVANTADA = 150
+
+_frame_parado_ref = None
+_frame_parado_desde = time.time()
+
+
+def _checar_frame_parado(frame):
+    """Se a imagem da camera do resgate ficar TEMPO_FRAME_PARADO_LEVANTA_GARRA
+    segundos sem mudar (robo travado/encostado), levanta a garra (servo
+    pesado). Chamar a cada frame lido."""
+    global _frame_parado_ref, _frame_parado_desde
+    pequeno = cv2.cvtColor(cv2.resize(frame, (160, 90)), cv2.COLOR_BGR2GRAY)
+    agora = time.time()
+
+    if _frame_parado_ref is None or np.mean(cv2.absdiff(pequeno, _frame_parado_ref)) >= LIMIAR_DIFF_FRAME_PARADO:
+        _frame_parado_ref = pequeno
+        _frame_parado_desde = agora
+        return
+
+    if agora - _frame_parado_desde >= TEMPO_FRAME_PARADO_LEVANTA_GARRA:
+        print(f"[TRAVADO] Imagem parada ha {agora - _frame_parado_desde:.1f}s, levantando a garra")
+        mover_servo_direto(PINO_PESADO, ANGULO_GARRA_LEVANTADA, manter_pulso=True)
+        time.sleep(0.6)
+        parar_servo(PINO_PESADO)
+        _frame_parado_ref = None
+        _frame_parado_desde = time.time()
+
+
 def capturar_crop():
     for _ in range(6):
         cap.read()
@@ -939,37 +916,19 @@ def capturar_crop():
     if not ret:
         return None
     _escrever_frame_gravacao(frame)
+    _checar_frame_parado(frame)
     return center_crop(frame, CROP_W, CROP_H)
 
 def classe_bola_alvo():
-    """Qual classe de bola o robo deve procurar AGORA, baseado em quantas
-    entregas ja foram feitas (entregas_realizadas - que ja honra
-    ENTREGAS_HERDADAS entre reinicios via --entregas=N, entao sobrevive a
-    troca de processo). Ordem exigida: QTD_PRATA_ENTREGAS bolas prata
-    primeiro, so depois QTD_PRETA_ENTREGAS preta. Devolve o class_id do
-    modelo, ou None se o modelo ainda nao carregou ou essa classe nao
-    existir nele (nesse caso quem chamar deve tratar como "sem filtro")."""
     nome_alvo = "bola-prata" if entregas_realizadas < QTD_PRATA_ENTREGAS else "bola-preta"
     return CLASSE_POR_NOME.get(nome_alvo)
 
 def so_falta_uma_bola_do_alvo():
-    """True quando so resta 1 bola da classe alvo atual (classe_bola_alvo())
-    em todo o campo - a preta sempre (so existe 1 no campo inteiro) e a
-    prata so na ultima (quando ja entregou QTD_PRATA_ENTREGAS-1). Nesse
-    caso, qualquer bola dessa classe vista, PERTO OU LONGE, so pode ser
-    ela mesma - nao faz sentido ignorar so por estar longe (ver
-    bola_ainda_no_chao())."""
     if entregas_realizadas >= QTD_PRATA_ENTREGAS:
-        return True  # alvo e preta - so existe 1 no campo inteiro
+        return True
     return entregas_realizadas == QTD_PRATA_ENTREGAS - 1
 
 def escolher_alvo(boxes):
-    """Prata tem prioridade sobre preta SEMPRE - mesmo que o alvo oficial do
-    momento (classe_bola_alvo()) ja seja preta (quota de QTD_PRATA_ENTREGAS
-    ja cumprida), se aparecer uma prata no frame (ex: uma sobrando alem da
-    quota) o robo pega e entrega ela primeiro, so depois volta a procurar a
-    preta. Devolve (idx, classe_desejada) prontos pra usar em
-    centralizar_bola()/aproximar_bola()/pegar_e_entregar_bola()."""
     classe_prata = CLASSE_POR_NOME.get("bola-prata")
     if classe_prata is not None and boxes is not None:
         idx_prata = escolher_indice_mais_perto(boxes, classe_prata)
@@ -982,11 +941,6 @@ def escolher_alvo(boxes):
 
 
 def escolher_indice_mais_perto(boxes, classe_desejada=None):
-    """Entre as caixas detectadas, escolhe a de maior area (mais perto).
-    Se classe_desejada (class_id) for passada, SO considera caixas dessa
-    classe - ignora as outras mesmo que maiores/mais pertas. Se nenhuma
-    caixa bater com a classe desejada, devolve None (nao cai pra
-    qualquer bola por engano)."""
     if boxes is None or len(boxes) == 0:
         return None
     maior_area = -1
@@ -998,6 +952,10 @@ def escolher_indice_mais_perto(boxes, classe_desejada=None):
             if cls_i != classe_desejada:
                 continue
         x1, y1, x2, y2 = map(int, boxes.xyxy[i].tolist())
+        # (1) base da caixa alta demais na imagem = nao esta no chao (foto na parede)
+        if MODO_ANTI_BOLA_FALSA and FILTRO_ALTURA_BOLA and y2 < Y2_MIN_BOLA_CHAO:
+            print(f"[FILTRO ALTURA] Caixa descartada: y2={y2} < {Y2_MIN_BOLA_CHAO} (alta demais, foto na parede?)")
+            continue
         area = (x2 - x1) * (y2 - y1)
         if area > maior_area:
             maior_area = area
@@ -1075,8 +1033,6 @@ def _abrir_camera_linha_generica(fonte):
     return None
 
 def _resolver_dev_real(fonte):
-    """Resolve indice/path pro /dev/videoN real por tras (segue symlink de
-    by-id). None se nao existir/nao conseguir resolver."""
     if isinstance(fonte, int):
         fonte = f"/dev/video{fonte}"
     try:
@@ -1086,12 +1042,6 @@ def _resolver_dev_real(fonte):
 
 
 def _e_camera_de_resgate(fonte):
-    """True se `fonte` (indice ou path) resolve pro MESMO dispositivo
-    fisico da camera de resgate (CAMERA_INDEX, ja aberta como `cap` nesse
-    processo). A ordem de enumeracao USB NAO e fixa entre reconexoes (ja
-    vimos mudar na pratica) - um indice fixo decorado nao bastava pra
-    evitar que a busca da camera de baixo "roubasse" a camera de resgate
-    sem perceber."""
     alvo = _resolver_dev_real(fonte)
     resgate_dev = _resolver_dev_real(CAMERA_INDEX)
     return alvo is not None and alvo == resgate_dev
@@ -1173,14 +1123,6 @@ def _detectar_camera_resgate():
     return None
 
 def abrir_camera_resgate():
-    """Mesmo esquema robusto de abrir_camera_linha() (by-id -> varredura de
-    indice -> reset USB a cada USB_RESET_TENTATIVAS_ANTES_DE_RESETAR falhas)
-    - antes a camera de resgate so tentava abrir UMA vez no boot e, se
-    falhasse (USB flakey, camera ainda enumerando), o processo inteiro
-    morria com exit(1). Como main.py/systemd reinicia do zero (sem --auto)
-    quando resgate.py morre assim, isso perdia a rodada inteira por uma
-    falha transitoria de camera - exatamente o tipo de coisa que
-    iniciar_camera()/abrir_camera_linha() ja sabem tentar de novo."""
     tentativas = 0
     cap_local = _detectar_camera_resgate()
     while cap_local is None:
@@ -1195,17 +1137,6 @@ def abrir_camera_resgate():
     return cap_local
 
 def _mask_linha_baixo(frame):
-    """Mascara preto/branco da camera de baixo (saida) - mesma logica de
-    seguimento_de_linha.visao() (mesmo limiar/kernel/corte de topo, ver
-    LIMIAR/kernal la), so que devolvendo so a mascara: acionar_saida()
-    decide por CONTAGEM de pixel preto (cv2.countNonZero), nao por
-    contorno, entao nao usa _maior_contorno_linha().
-
-    Nao importa seguimento_de_linha.visao() de verdade de proposito - esse
-    modulo importa config.py, que reivindica os MESMOS pinos GPIO que
-    resgate.py ja reivindica sozinho no proprio boot (ver secao BOOT/
-    INICIALIZACAO mais abaixo) - importar entraria em conflito de recurso
-    na hora (dois claims na mesma linha GPIO, dentro do mesmo processo)."""
     h_, w_ = frame.shape[:2]
     roi = frame[int(h_ * 0.1):h_, :]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -1288,10 +1219,6 @@ def detectar_linha_horizontal_embaixo(frame):
     return desvio_horizontal <= TOLERANCIA_ANGULO_HORIZONTAL_LINHA
 
 def confirmar_saida_lateral():
-    """So confirma abertura lateral (sonar) como saida de verdade se o
-    contorno visto na camera de baixo for HORIZONTAL - vertical e "entrada"
-    (falso positivo, mesmo criterio de acionar_saida()) e a ausencia de
-    contorno tambem nao confirma nada, so ignora e continua tentando."""
     achou = False
     inicio = time.time()
     while time.time() - inicio < 3.0:
@@ -1308,8 +1235,6 @@ def confirmar_saida_lateral():
 
 def alinhar_na_linha():
 
-    # Nao precisa centralizar o contorno (cx) - so ver a linha aparecer ja
-    # basta, igual confirmar_saida_lateral() ja fazia com detectar_linha_embaixo().
     FRAMES_CONFIRMACAO = 3
     ALINHAR_VEL = 13
     frames_detectados_seguidos = 0
@@ -1331,13 +1256,6 @@ def alinhar_na_linha():
 # ===================== FUNCOES DE BOLA =====================
 
 def detectar_bola(crop, classe_desejada=None):
-    """classe_desejada (class_id, opcional) filtra pra so considerar bolas
-    dessa classe - usado pra manter o robo mirando no MESMO tipo de bola
-    (prata ou preta, conforme classe_bola_alvo()) durante centralizacao/
-    aproximacao, em vez de trocar de alvo se uma bola de outra cor aparecer
-    mais perto no meio do caminho. None (padrao) = qualquer bola serve,
-    igual antes - usado por buscar_bola()/verificar_e_afastar_bola_bloqueio()
-    (busca final e desobstrucao aceitam qualquer bola de propósito)."""
     results = model.predict(
         crop, imgsz=(320, 256), conf=CONF_THRES, verbose=False, show=False
     )
@@ -1421,6 +1339,8 @@ def centralizar_bola(classe_desejada=None):
 def aproximar_bola(classe_desejada=None):
     crop_area = CROP_W * CROP_H
     perdida = 0
+    ref_paralaxe = None  # (largura, y2) da primeira deteccao - pro teste de paralaxe
+    paralaxe_testada = False
 
     for passo in range(MAX_APPROACH_STEPS):
         checar_parada()
@@ -1448,6 +1368,27 @@ def aproximar_bola(classe_desejada=None):
         perdida = 0
         ratio = area / crop_area
         print(f"passo={passo} area_ratio={ratio:.2f} cx={cx}")
+
+        # (6) Paralaxe: chegou bem mais perto (caixa cresceu) mas a base nao
+        # desceu na imagem = nao esta no chao, e foto na parede.
+        if MODO_ANTI_BOLA_FALSA and FILTRO_PARALAXE_BOLA and not paralaxe_testada and bbox is not None:
+            bx1, _by1, bx2, by2 = bbox
+            largura = max(bx2 - bx1, 1)
+            if ref_paralaxe is None:
+                ref_paralaxe = (largura, by2)
+                if by2 >= CROP_H - PARALAXE_MARGEM_BAIXO_PX:
+                    paralaxe_testada = True  # ja colada no fundo, nao tem como descer
+            elif largura >= ref_paralaxe[0] * PARALAXE_CRESCIMENTO_MIN:
+                paralaxe_testada = True
+                descida = by2 - ref_paralaxe[1]
+                print(f"[PARALAXE] largura {ref_paralaxe[0]}->{largura}, y2 {ref_paralaxe[1]}->{by2} (desceu {descida}px, minimo {PARALAXE_DESCIDA_MIN_PX})")
+                if descida < PARALAXE_DESCIDA_MIN_PX:
+                    print("[PARALAXE] Chegou perto mas a bola nao desceu na imagem - foto na parede, desistindo")
+                    parar_motores()
+                    mover(-20, -20)
+                    time.sleep(0.3)
+                    parar_motores()
+                    return False
 
         if ratio >= STOP_AREA_RATIO:
             print(f"[APROXIMAR] area_ratio={ratio:.2f} bateu o limiar, confirmando de novo...")
@@ -1492,17 +1433,6 @@ def aproximar_bola(classe_desejada=None):
     return False
 
 def bola_ainda_no_chao(classe_desejada):
-    """Depois de fechar/levantar a garra e recuar, tira uma foto nova e
-    confere se AINDA ve uma bola da classe procurada - se ver, a garra
-    errou (a bola continua no chao, nao esta dentro da garra de verdade).
-
-    Normalmente so conta como "ainda no chao" se a bola estiver PERTO
-    (area grande) - uma vista longe pode ser outra bola da mesma classe em
-    outro canto do campo, entao nao teria como saber se e a mesma que
-    acabou de tentar pegar. MAS se so_falta_uma_bola_do_alvo() (so resta
-    UMA bola dessa classe no campo inteiro), qualquer deteccao - perto ou
-    longe - so pode ser ela mesma, entao conta como "nao pegou" direto,
-    sem olhar a distancia."""
     crop = capturar_crop()
     if crop is None:
         return False
@@ -1519,11 +1449,6 @@ def bola_ainda_no_chao(classe_desejada):
     return ratio >= LIMIAR_AREA_BOLA_NAO_PEGA
 
 def soltar_bola_de_seguranca():
-    """So defensivo - NAO e uma entrega de verdade (nao anda nem procura
-    area de entrega, so abre/sacode a garra onde o robo estiver). Chamada
-    antes de comecar a procurar de novo quando _garra_com_captura_nao_entregue
-    ainda ta True, pra garantir que nao fica carregando por aí uma bola que
-    uma captura anterior fechou em cima mas nunca chegou a entregar."""
     print("[SEGURANCA] Captura anterior nunca foi entregue - soltando a garra antes de procurar de novo")
     checar_parada()
     mover_servo(PINO_PESADO, 50, velocidade=100)
@@ -1534,22 +1459,6 @@ def soltar_bola_de_seguranca():
     mover_servo(PINO_PESADO, 140, velocidade=100)
 
 def pegar_e_entregar_bola(classe_desejada):
-    """Centraliza, aproxima, fecha a garra e entrega uma bola ja avistada
-    (pelo loop principal ou por buscar_bola() na busca final). Devolve True
-    se pegou e entregou DE VERDADE (so ai incrementa entregas_realizadas) -
-    False se perdeu a bola no meio do caminho (saiu do campo de visao,
-    ou era so uma deteccao efemera/falso positivo que nao resistiu a
-    centralizacao/aproximacao de verdade). Quem chamar deve tratar False
-    como "nao tinha bola nenhuma ali", nao como erro.
-
-    centralizar_bola() ja checa sozinha se a bola ja esta centralizada (cx
-    dentro de TOLERANCE) e retorna True na hora sem girar - chamar ela aqui
-    sempre, mesmo sem saber o cx atual de antemao, e seguro e barato.
-
-    Depois de fechar a garra, confirma com bola_ainda_no_chao() que ela
-    pegou de verdade - se a garra errou e a bola ficou no chao, tenta a
-    sequencia inteira de novo (recentraliza/reaproxima/fecha garra) ate
-    MAX_TENTATIVAS_PEGAR_BOLA vezes antes de desistir dessa bola."""
     global entregas_realizadas, _garra_com_captura_nao_entregue
 
     for tentativa in range(1, MAX_TENTATIVAS_PEGAR_BOLA + 1):
@@ -1579,11 +1488,11 @@ def pegar_e_entregar_bola(classe_desejada):
         mover(-1,-1)
         time.sleep(0.09)
         parar_motores()
-        angulo(180) #0 - esquema novo do copo: 0 antigo agora e 180
+        angulo(180)  # 0
         mover(15,15)
         time.sleep(0.15)
         parar_motores()
-        mover_servo(PINO_PESADO, 0, velocidade=100)
+        descer_garra_toda()  # era mover_servo(PINO_PESADO, -2) - o -2 virava 0 (mover_servo corta em 0)
         mover(20,20)
         time.sleep(0.5)
         parar_motores()
@@ -1603,7 +1512,7 @@ def pegar_e_entregar_bola(classe_desejada):
         mover(-25,-25)
         time.sleep(0.5)
         parar_motores()
-        _garra_com_captura_nao_entregue = True  # fechou a garra agora - so volta False depois de entregar_bola() de verdade
+        _garra_com_captura_nao_entregue = True
 
         if bola_ainda_no_chao(classe_desejada):
             print(f"[GARRA] Bola ainda no chao apos tentativa {tentativa}/{MAX_TENTATIVAS_PEGAR_BOLA} - garra errou, tentando pegar de novo")
@@ -1620,14 +1529,24 @@ def pegar_e_entregar_bola(classe_desejada):
     print(f"[GARRA] Nao conseguiu confirmar a bola na garra depois de {MAX_TENTATIVAS_PEGAR_BOLA} tentativas, desistindo dela")
     return False
 
+_classe_bola_confirmada = None
+
+def _detectar_bola_qualquer(crop):
+    results = model.predict(crop, imgsz=(320, 256), conf=CONF_THRES, verbose=False, show=False)
+    boxes = getattr(results[0], "boxes", None)
+    idx, classe = escolher_alvo(boxes)
+    if idx is None:
+        return None, None
+    x1, y1, x2, y2 = map(int, boxes.xyxy[idx].tolist())
+    return (x1 + x2) // 2, classe
+
 def _bola_confirmada(confirmacoes_necessarias):
-    """Captura + detecta, e so aceita se a bola aparecer em varios frames
-    seguidos sem girar mais (evita ruido/reflexo de 1 frame so)."""
+    global _classe_bola_confirmada
     crop = capturar_crop()
     if crop is None:
         return False
 
-    cx, area, bbox, cls_id = detectar_bola(crop)
+    cx, classe_vista = _detectar_bola_qualquer(crop)
     if cx is None:
         return False
 
@@ -1637,7 +1556,7 @@ def _bola_confirmada(confirmacoes_necessarias):
         crop_confirma = capturar_crop()
         if crop_confirma is None:
             break
-        cx_confirma, _, _, _ = detectar_bola(crop_confirma)
+        cx_confirma, _, _, _ = detectar_bola(crop_confirma, classe_vista)
         if cx_confirma is None:
             break
         confirmacoes += 1
@@ -1645,34 +1564,75 @@ def _bola_confirmada(confirmacoes_necessarias):
     if confirmacoes < confirmacoes_necessarias:
         print(f"[BUSCA FINAL] Deteccao efemera descartada ({confirmacoes}/{confirmacoes_necessarias} frames), continuando busca")
         return False
+    _classe_bola_confirmada = classe_vista
     return True
 
 
-def buscar_bola():
-    """Varredura de 360 graus por giros precisos do giroscopio (guinada2),
-    nao mais por tempo/velocidade chutados - GRAUS_POR_PASSO_BUSCA e do
-    tamanho do FOV de verdade da camera de resgate depois do center_crop
-    (ver calculo onde a constante e definida), entao nao fica buraco cego
-    entre uma foto e a proxima. Primeiro checa a posicao atual antes de
-    girar - a bola pode ja estar no campo de visao sem precisar mexer.
+def _ler_heading_ou_none():
+    try:
+        return _ler_heading_bruto()
+    except Exception as e:
+        print(f"[BUSCA] Falha ao ler heading ({e})")
+        return None
 
-    So uma volta de 360 - e a busca final (depois de MAX_ENTREGAS), nao
-    precisa reposicionar/tentar de novo: se nao achou, e porque nao tem
-    bola sobrando mesmo, e vai direto pra saida."""
+
+def _graus_girados(antes, depois, padrao=GRAUS_POR_PASSO_BUSCA):
+    """Quanto o robo girou DE VERDADE num passo de busca, pelo heading bruto
+    do BNO055 - ele nao e zerado pelo resetar_giroscopio() da guinada2, entao
+    conta tambem a inercia depois do freio (na pratica cada passo de 20 graus
+    gira ~30). Sem leitura valida, conta o passo como `padrao`."""
+    if antes is None or depois is None:
+        return padrao
+    return _normalizar(depois - antes)
+
+
+def buscar_bola():
     CONFIRMACAO_BUSCA_FINAL = 3
 
     checar_parada()
     if _bola_confirmada(CONFIRMACAO_BUSCA_FINAL):
         return True
 
-    for _ in range(MAX_PASSOS_BUSCA_360):
+    girado = 0.0
+    while girado < 360:
         checar_parada()
+        antes = _ler_heading_ou_none()
         guinada2('D', GRAUS_POR_PASSO_BUSCA, 20)
 
         if _bola_confirmada(CONFIRMACAO_BUSCA_FINAL):
             return True
+        girado += _graus_girados(antes, _ler_heading_ou_none())
 
     return False
+
+
+_varredura_prata_feita = False
+
+def varrer_360_por_prata():
+    while model is None:
+        checar_parada()
+        time.sleep(0.1)
+    classe_prata = CLASSE_POR_NOME.get("bola-prata")
+    if classe_prata is None:
+        return
+
+    print("[BUSCA PRATA] Uma volta procurando bola prata antes da preta...")
+    girado = 0.0
+    while girado < 360:
+        checar_parada()
+        crop = capturar_crop()
+        if crop is not None:
+            cx, _, _, _ = detectar_bola(crop, classe_prata)
+            if cx is not None:
+                print("[BUSCA PRATA] Achou prata, pegando...")
+                if pegar_e_entregar_bola(classe_prata):
+                    girado = 0.0
+                    continue
+        antes = _ler_heading_ou_none()
+        guinada2('D', GRAUS_POR_PASSO_BUSCA, 20)
+        time.sleep(0.25)
+        girado += _graus_girados(antes, _ler_heading_ou_none())
+    print("[BUSCA PRATA] Volta completa sem prata, indo atras da preta")
 
 def verificar_e_afastar_bola_bloqueio():
     crop = capturar_crop()
@@ -1897,14 +1857,6 @@ def reposicionar_canto(tentativa, vel_recuo=20):
         parar_motores()
 
 def reposicionar_brusco():
-    """Reposicionamento mais agressivo que reposicionar_canto() - so pra
-    quando a busca padrao completa VARREDURAS_360_ANTES_REPOSICIONAR voltas
-    de 360 SEM ACHAR NENHUMA bola (nao e o caso de achar e perder no meio do
-    caminho - isso continua usando reposicionar_canto() do jeito que ja
-    estava). Se nem uma volta inteira acha nada, o robo provavelmente esta
-    preso num canto/parede tampando a visao de verdade - recuo maior/mais
-    rapido + giro de verdade (guinada2, nao so um pivot cru) pra sair logo
-    dali, bem mais brusco que os passos curtos de reposicionar_canto()."""
     mover(30, 30)
     time.sleep(0.7)
     parar_motores()
@@ -1914,29 +1866,48 @@ def reposicionar_brusco():
     time.sleep(0.8)
     parar_motores()
 
-def buscar_triangulo():
-    """Giro continuo (turn_right a velocidade fixa, sem parar entre fotos) -
-    como era antes, nao os passos precisos de guinada2 usados em
-    buscar_bola(). Da ate VARREDURAS_360_TRIANGULO_ANTES_REPOSICIONAR voltas
-    de 360 (TRIANGULO_MAX_GIROS passos cada, com reposicionar_canto() entre
-    elas) antes de desistir e devolver False pro entregar_bola()."""
-    for varredura in range(VARREDURAS_360_TRIANGULO_ANTES_REPOSICIONAR):
-        for _ in range(TRIANGULO_MAX_GIROS):
-            checar_parada()
-            crop = capturar_crop()
-            if crop is not None:
-                cx, area, info = detectar_entrega(crop)
-                if cx is not None:
-                    cor_dbg = info["cor"] if info else "?"
-                    area_dbg = info["area"] if info else area
-                    print(f"[BUSCAR_TRIANGULO] Detectado cor={cor_dbg} area={area_dbg} cx={cx}")
-                    return True
-            turn_right(speed=15)
-            time.sleep(0.3)
+def _volta_procurando_triangulo(velocidade, tempo_max=None):
+    """Uma volta de 360 (medida no giroscopio) girando intermitente -
+    turn_right por 0.3s, olha a camera, repete. Termina ao completar 360 OU,
+    se tempo_max for passado, ao passar tempo_max segundos (se algo travar o
+    giro). True se achou o triangulo."""
+    girado = 0.0
+    heading_anterior = _ler_heading_ou_none()
+    inicio = time.time()
+    while True:
+        if girado >= 360:
+            return False
+        if tempo_max is not None and time.time() - inicio >= tempo_max:
+            print(f"[BUSCAR_TRIANGULO] Volta estourou {tempo_max:.0f}s com so {girado:.0f} graus girados (travado?), seguindo")
+            return False
+        checar_parada()
+        crop = capturar_crop()
+        if crop is not None:
+            cx, area, info = detectar_entrega(crop)
+            if cx is not None:
+                cor_dbg = info["cor"] if info else "?"
+                area_dbg = info["area"] if info else area
+                print(f"[BUSCAR_TRIANGULO] Detectado cor={cor_dbg} area={area_dbg} cx={cx}")
+                return True
+        turn_right(speed=velocidade)
+        time.sleep(0.3)
+        # Mede de leitura em leitura (nao antes/depois do turn_right) - o
+        # motor continua ligado enquanto a camera le, e esse giro tambem conta.
+        heading_atual = _ler_heading_ou_none()
+        girado += _graus_girados(heading_anterior, heading_atual, padrao=4.0)
+        heading_anterior = heading_atual
 
-        if varredura < VARREDURAS_360_TRIANGULO_ANTES_REPOSICIONAR - 1:
-            print(f"[BUSCAR_TRIANGULO] Volta {varredura + 1}/{VARREDURAS_360_TRIANGULO_ANTES_REPOSICIONAR} sem achar, reposicionando...")
-            reposicionar_canto(varredura + 1, vel_recuo=25)
+
+def buscar_triangulo():
+    for volta in range(VOLTAS_TRIANGULO_NORMAL):
+        print(f"[BUSCAR_TRIANGULO] Volta {volta + 1}/{VOLTAS_TRIANGULO_NORMAL} (vel {VEL_GIRO_TRIANGULO})")
+        if _volta_procurando_triangulo(VEL_GIRO_TRIANGULO):
+            return True
+    for volta in range(VOLTAS_TRIANGULO_LENTO):
+        print(f"[BUSCAR_TRIANGULO] Volta lenta {volta + 1}/{VOLTAS_TRIANGULO_LENTO} (vel {VEL_GIRO_TRIANGULO_LENTO})")
+        if _volta_procurando_triangulo(VEL_GIRO_TRIANGULO_LENTO, TEMPO_MAX_VOLTA_TRIANGULO_LENTO):
+            return True
+    print("[BUSCAR_TRIANGULO] Nao achou nas voltas, reposicionando...")
     return False
 
 def entregar_bola(cor_alvo=None):
@@ -1989,7 +1960,7 @@ def entregar_bola(cor_alvo=None):
     parar_motores()          # <-- adiciona os parêntese
     mover_servo(PINO_PESADO, 20, velocidade=100)
     mover_servo(PINO_PESADO, 50, velocidade=100)
-    mover_servo(PINO_SG90, 120, velocidade=100) #60 - max, estava parando no meio do caminho #140, 130
+    mover_servo(PINO_SG90, 120, velocidade=100)  # 60
     mover_servo(PINO_SG90, 180, velocidade=100)
     mover_servo(PINO_SG90, 120, velocidade=100)
     mover_servo(PINO_SG90, 180, velocidade=100)
@@ -2005,175 +1976,31 @@ def entregar_bola(cor_alvo=None):
 
 # ===================== SAIDA =====================
 
-def acionar_saida():
-    mover_servo(PINO_PESADO, 130)
-    abrir_camera_linha()  # cap_linha (camera de baixo) - nunca era chamada antes, ficava None pra sempre
-
-    try:
-        #movimentos_bases.guinada2('D', 80, 15)
-        while True:
-            mover(-15,15)
-            if distancia_frente() < 80:
-   
-                break
-   
-        mover(28,30)
-        time.sleep(4.0)
-        mover(-17,-17)
-        time.sleep(0.7)
-        guinada2('D', 85, 15)
-        while True:
-            checar_parada()
-   
-            if not sonar_valido():
-                time.sleep(0.02)
-                continue
-   
-            frente = distancia_frente()
-            esquerda = distancia_esquerda()
-   
-   
-   
-            ret, frame_baixo = cap_linha.read()
-            if ret:
-                mask = _mask_linha_baixo(frame_baixo)
-                pixels_pretos = cv2.countNonZero(mask)
-                if pixels_pretos > 20000:
-                    print("muito pixel preto")
-            else:
-                pixels_pretos = 0
-            print(f"pixels_pretos={pixels_pretos}")
-   
-   
-            mover(16, 16)
-            print(angulo_z())
-            if frente < 9 :
-                print("paredeeee")
-                resetar_giroscopio()
-                angulozero =angulo_z()
-                mover(30, 30)
-                time.sleep(1.5)
-                if (angulo_z() - angulozero) < -20:
-                    guinada2('D', 86, 15)
-                    mover(19, 19)
-                    time.sleep(0.9)
-                    guinada2('D', 40, 15)
-                else:
-                    mover(-15, -15)
-                    time.sleep(0.7)
-                    guinada2('D', 84, 15)
-   
-            if 24000 < pixels_pretos < 28000:
-                print("saida frente")
-                mover(-15,-15)
-                time.sleep(0.2)
-                inicio_frente = time.time()
-                while pixels_pretos <= 29000 and time.time() - inicio_frente <= 0.9:
-                    checar_parada()
-                    mover(15, 15)
-                    ret2, frame2 = cap_linha.read()
-                    if ret2:
-                        mask2 = _mask_linha_baixo(frame2)
-                        pixels_pretos = cv2.countNonZero(mask2)
-                    time.sleep(0.02)
-                parar_motores()
-                print("pixels_pretos=", pixels_pretos)
-                if pixels_pretos >= 29000:
-                    print("saiiiiiii")
-                    mover(15,15)
-                    time.sleep(0.9)
-                    guinada2('E', 20, 15)
-                    alinhar_na_linha()
-                    time.sleep(2.0)
-                    parar_motores()
-                    parar_gravacao_percurso()
-                    cap.release()
-                    if cap_linha is not None:
-                        cap_linha.release()
-                    GPIO.gpiochip_close(h)
-                    os.execv(sys.executable, [
-                        sys.executable,
-                        "/home/pi/ROBO_DOGO_2026/codes_rasp/LINE_FOLLOWER/main.py",
-                        "--auto",
-                        f"--entregas={entregas_realizadas}",
-                    ])
-
-                else:
-                    mover(-15,-15)
-                    time.sleep(2.0)
-                    guinada2('D', 86, 15)
-                    mover(18,18)
-                    time.sleep(1.2)
-            if esquerda > 40:
-                print("buracooooo")
-                mover(-2,-2)
-                time.sleep(0.4)
-                mover(15,15)
-                time.sleep(0.4)
-                guinada2('E', 86, 15)
-   
-                inicio_frente = time.time()
-                while pixels_pretos <= 30000 and time.time() - inicio_frente <= 2.1:
-                    checar_parada()
-                    mover(15, 15)
-                    ret2, frame2 = cap_linha.read()
-                    if ret2:
-                        mask2 = _mask_linha_baixo(frame2)
-                        pixels_pretos = cv2.countNonZero(mask2)
-                    time.sleep(0.02)
-                parar_motores()
-                print("pixels_pretos=", pixels_pretos)
-                if pixels_pretos > 29000:
-                    print("saiiiiiii")
-                    mover(15,15)
-                    time.sleep(0.9)
-                    guinada2('E', 20, 15)
-                    alinhar_na_linha()
-                    time.sleep(2.0)
-                    parar_motores()
-                    parar_gravacao_percurso()
-                    cap.release()
-                    if cap_linha is not None:
-                        cap_linha.release()
-                    GPIO.gpiochip_close(h)
-                    os.execv(sys.executable, [
-                        sys.executable,
-                        "/home/pi/ROBO_DOGO_2026/codes_rasp/LINE_FOLLOWER/main.py",
-                        "--auto",
-                        f"--entregas={entregas_realizadas}",
-                    ])
-   
-                else:
-   
-                    mover(-15,-15)
-                    time.sleep(1.6)
-                    guinada2('D', 86, 15)
-                    if distancia_frente() < 15:
-                        mover(-15,-15)
-                        time.sleep(0.3) #0.3
-                        guinada2('D', 86, 15)
-   
-                    mover(18,18)
-                    time.sleep(1.2)
-                    
-    finally:
-     parar_motores()
+def ir_pra_saida():
+    """A saida (ir ate o canto vermelho + sair da sala) mora no
+    minha_saida.py, processo proprio - fecha tudo e passa pra ele, levando a
+    contagem de entregas."""
+    print("[SAIDA] Indo pro minha_saida.py")
+    parar_motores()
+    parar_gravacao_percurso()
+    cap.release()
+    if cap_linha is not None:
+        cap_linha.release()
+    GPIO.gpiochip_close(h)
+    os.execv(sys.executable, [
+        sys.executable,
+        "/home/pi/ROBO_DOGO_2026/codes_rasp/LINE_FOLLOWER/minha_saida.py",
+        f"--entregas={entregas_realizadas}",
+    ])
 
 def finalizar_resgate():
-    """Ja bateu MAX_ENTREGAS (seja pegando a ultima bola agora no loop
-    principal, seja logo no BOOT por causa de um --entregas=N ja no maximo -
-    reinicio apos falha de progresso/botao no meio/depois da saida, onde o
-    seguidor achou a sala de novo e chamou resgate.py de novo por cima).
-    Tenta pegar bola(s) sobrando com buscar_bola() ate MAX_TENTATIVAS_BUSCA_FINAL
-    vezes e, sem achar mais nada, aciona a saida - nunca mais volta a
-    procurar bola do zero. Nunca retorna normalmente (acionar_saida() so sai
-    por execv ou RoboParado, ver comentario dela)."""
     print(f"[BOOT] {entregas_realizadas} entregas ja feitas, fazendo busca final antes da saida...")
     for _ in range(MAX_TENTATIVAS_BUSCA_FINAL):
         if not buscar_bola():
             break
-        print("[BUSCA FINAL] Achou bola sobrando, tentando pegar e entregar...")
-        if pegar_e_entregar_bola(classe_bola_alvo()):
+        classe_vista = _classe_bola_confirmada if _classe_bola_confirmada is not None else classe_bola_alvo()
+        print(f"[BUSCA FINAL] Achou bola sobrando (classe {classe_vista}), tentando pegar e entregar...")
+        if pegar_e_entregar_bola(classe_vista):
             print(f"[BUSCA FINAL] Entrega extra concluida ({entregas_realizadas} no total), verificando se sobrou mais alguma")
         else:
             print("[BUSCA FINAL] Deteccao nao se confirmou (bola sumiu/falso positivo), tentando de novo")
@@ -2188,13 +2015,9 @@ def finalizar_resgate():
             time.sleep(1)
         print("[ASR_2026] Pausa terminada, acionando a saida")
 
-    acionar_saida()
+    ir_pra_saida()
 
 def voltar_pro_seguidor(motivo="Robo parado pelo botao, voltando pro seguidor..."):
-    """Fecha tudo (motores/cameras/GPIO) e devolve o controle pro main.py,
-    preservando entregas_realizadas via --entregas=N - usada tanto pelo
-    RoboParado do loop principal quanto pelo boot-time finalizar_resgate()
-    (se o botao for apertado durante a busca final/saida logo no boot)."""
     print(motivo)
     parar_motores()
     parar_gravacao_percurso()
@@ -2247,11 +2070,6 @@ if entregas_realizadas > 0:
 
 threading.Thread(target=botao_thread, daemon=True).start()
 
-# Reinicio (falha de progresso / botao) com as entregas ja no maximo - o
-# seguidor achou a sala de novo e chamou resgate.py de volta, mas nao tem
-# bola nenhuma pra procurar. Vai direto pra busca final/saida, sem entrar
-# no loop de busca normal (que nunca ia chegar la sozinho, ja que aquela
-# checagem so roda depois de PEGAR uma bola de verdade).
 if entregas_realizadas >= MAX_ENTREGAS:
     try:
         finalizar_resgate()
@@ -2263,26 +2081,29 @@ if entregas_realizadas >= MAX_ENTREGAS:
 try:
     _ultimo_heartbeat[0] = time.time()
     print("Iniciando busca por bolas...")
-    passos_busca_padrao = 0
+    graus_busca_padrao = 0.0
     while True:
         try:
             checar_parada()
-            # Mesmo giro preciso pelo giroscopio de buscar_bola()/
-            # buscar_triangulo() - GRAUS_POR_PASSO_BUSCA e do tamanho do FOV
-            # real da camera de resgate depois do center_crop, entao a
-            # varredura nao deixa buraco cego entre uma foto e a proxima.
+
+            classe_preta = CLASSE_POR_NOME.get("bola-preta")
+            if not _varredura_prata_feita and classe_preta is not None and classe_bola_alvo() == classe_preta:
+                varrer_360_por_prata()
+                _varredura_prata_feita = True
+                graus_busca_padrao = 0.0
+                if entregas_realizadas >= MAX_ENTREGAS:
+                    finalizar_resgate()
+                    break
+
+            heading_antes = _ler_heading_ou_none()
             guinada2('D', GRAUS_POR_PASSO_BUSCA, 20)
             time.sleep(0.25)
 
-            # Busca padrao roda pra sempre (nao desiste como a busca final) -
-            # se der VARREDURAS_360_ANTES_REPOSICIONAR voltas inteiras sem
-            # achar nada, o ponto onde o robo esta pode estar tampando a
-            # visao (parede/quina perto de mais). Reposiciona e continua.
-            passos_busca_padrao += 1
-            if passos_busca_padrao >= MAX_PASSOS_BUSCA_360 * VARREDURAS_360_ANTES_REPOSICIONAR:
+            graus_busca_padrao += _graus_girados(heading_antes, _ler_heading_ou_none())
+            if graus_busca_padrao >= 360 * VARREDURAS_360_ANTES_REPOSICIONAR:
                 print(f"[BUSCA] {VARREDURAS_360_ANTES_REPOSICIONAR} voltas de 360 sem achar NENHUMA bola, reposicionamento brusco...")
                 reposicionar_brusco()
-                passos_busca_padrao = 0
+                graus_busca_padrao = 0.0
 
             for _ in range(4):
                 cap.read()
@@ -2290,6 +2111,7 @@ try:
             ret, frame = cap.read()
             if ret:
                 _escrever_frame_gravacao(frame)
+                _checar_frame_parado(frame)
             if not ret:
                 falhas_camera_seguidas += 1
                 print(f"Erro na câmera ({falhas_camera_seguidas}/{FALHAS_CAMERA_ANTES_DE_DESISTIR})")
@@ -2336,21 +2158,8 @@ try:
 
                 if not pegar_e_entregar_bola(classe_desejada):
                     continue
-                # So reseta o contador de "sem achar nada" numa entrega DE
-                # VERDADE (bola pega e entregue) - resetar so por causa de
-                # uma deteccao (linha antiga fazia isso) deixava um falso
-                # positivo persistente (sombra/reflexo classificado como
-                # bola) impedir pra sempre o reposicionamento, porque toda
-                # hora achava "alguma coisa" e zerava o contador de novo -
-                # o robo ficava girando pra sempre atras de uma bola que
-                # nao existe, sem nunca completar as voltas necessarias
-                # pra reposicionar e tentar de outro angulo.
-                passos_busca_padrao = 0
+                graus_busca_padrao = 0.0
 
-                # entregar_bola()/pegar_e_entregar_bola() acima ja podem ter
-                # levantado RoboParado antes de chegar aqui - se bateu
-                # MAX_ENTREGAS, finalizar_resgate() cuida da busca final e
-                # da saida (nunca retorna normalmente).
                 if entregas_realizadas >= MAX_ENTREGAS:
                     finalizar_resgate()
                     break

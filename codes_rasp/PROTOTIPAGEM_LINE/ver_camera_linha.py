@@ -32,10 +32,7 @@ def main():
             ret, frame = cap.read()
             if not ret:
                 continue
-            escala = 3
-            h, w = frame.shape[:2]
-            grande = cv2.resize(frame, (w * escala, h * escala), interpolation=cv2.INTER_NEAREST)
-            cv2.imshow("Camera de linha - ao vivo", grande)
+            cv2.imshow("Camera de linha - ao vivo", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     except KeyboardInterrupt:

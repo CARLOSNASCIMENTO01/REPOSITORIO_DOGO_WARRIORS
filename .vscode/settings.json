@@ -1,0 +1,50 @@
+{
+    // --- nao vigiar/indexar venvs, modelos e lixo (77 mil arquivos -> poucas centenas) ---
+    "files.watcherExclude": {
+        "**/env_dogo/**": true,
+        "**/env_moondream/**": true,
+        "**/__pycache__/**": true,
+        "**/.git/objects/**": true,
+        "**/*.onnx": true,
+        "**/*.jpg": true,
+        "**/*.png": true,
+        "**/*.mp4": true
+    },
+    "search.exclude": {
+        "**/env_dogo": true,
+        "**/env_moondream": true,
+        "**/__pycache__": true
+    },
+    "files.exclude": {
+        "**/__pycache__": true
+    },
+
+    // --- Pylance leve: so analisa arquivo aberto, nao o projeto inteiro ---
+    "python.analysis.exclude": [
+        "**/env_dogo/**",
+        "**/env_moondream/**",
+        "**/__pycache__/**"
+    ],
+    "python.analysis.diagnosticMode": "openFilesOnly",
+    "python.analysis.indexing": false,
+    "python.analysis.typeCheckingMode": "off",
+    "python.analysis.autoImportCompletions": false,
+    "python.defaultInterpreterPath": "${workspaceFolder}/env_dogo/bin/python3",
+
+    // --- cpptools: so serve pro .ino, sem indexar o projeto ---
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "C_Cpp.autocomplete": "disabled",
+    "C_Cpp.errorSquiggles": "disabled",
+    "C_Cpp.workspaceParsingPriority": "lowest",
+    "C_Cpp.files.exclude": {
+        "**/env_dogo": true,
+        "**/env_moondream": true
+    },
+
+    // --- menos trabalho de interface (ajuda o VNC) ---
+    "git.autorefresh": false,
+    "editor.minimap.enabled": false,
+    "workbench.reduceMotion": "on",
+    "editor.smoothScrolling": false,
+    "terminal.integrated.gpuAcceleration": "off"
+}

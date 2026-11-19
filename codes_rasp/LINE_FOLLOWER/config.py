@@ -1,15 +1,3 @@
-"""
-Hardware do seguidor de linha: estado de execucao/parada, GPIO, motores
-(placa Yahboom), servos, botao, giroscopio (BNO055), sonar (serial do
-Arduino) e camera de linha. Tudo que os outros modulos (movimentos_bases,
-seguimento_de_linha, obstaculos_trajeto, resgate_de_vitimas) importam pra
-poder mexer no robo de verdade.
-
-`cap` e dono deste modulo: iniciar_camera() atribui com `global cap`. Quem
-precisar ler frame em outro modulo usa `import config` e `config.cap.read()`
-- nunca `from config import cap` (isso capturaria o `None` inicial e nunca
-veria a camera real depois de aberta).
-"""
 
 import fcntl
 import math
@@ -21,6 +9,10 @@ import time
 from threading import Thread
 
 import cv2
+try:
+    cv2.setLogLevel(2)  # 2 = ERROR
+except Exception:
+    pass
 import lgpio
 import serial
 import serial.tools.list_ports
@@ -30,12 +22,16 @@ import smbus2
 # ESTADO DE EXECUCAO / PARADA IMEDIATA
 # =========================================================================
 class RoboParado(Exception):
-    """Levantada quando o botao pede parada, pra abortar QUALQUER loop na hora."""
     pass
 
 
 robo_ativo = threading.Event()
 ENTREGAS_HERDADAS = 0
+
+# Existe = a saida ja comecou nessa rodada: ao achar a sala de resgate de novo
+# o seguidor vai direto pro minha_saida.py, sem refazer o resgate. Criado pelo
+# minha_saida.py, apagado pelo main.py quando ele e' iniciado do zero.
+ARQUIVO_SAIDA_INICIADA = "/tmp/robo_dogo_saida_iniciada"
 if "--auto" in sys.argv:
     robo_ativo.set()
 else:
@@ -50,10 +46,23 @@ for arg in sys.argv[1:]:
 
 
 def checar_parada():
-    """Chamar a cada iteracao de todo while True que segura o robo por mais
-    de um instante (guinadas, desvio, resgate, etc). Custo desprezivel."""
     if not robo_ativo.is_set():
         raise RoboParado()
+
+
+# =========================================================================
+# AJUSTE FINO
+# =========================================================================
+# NAO e' aqui que muda: o VEL_MAX de verdade fica no seguimento_de_linha.py
+# (junto do VEL_BASE) e sobrescreve este assim que ele e' importado. Este so'
+# vale pra script que importa config sem o seguidor (ex: teste_velocidade_reta.py).
+VEL_MAX = 21
+VEL_MIN = -VEL_MAX
+
+GANHO_RODA_TRAS = 1.00  # 7% a mais - testado ~10 unidades a mais na faixa de velocidade usual
+
+camera_x = 160
+camera_y = 120
 
 
 # =========================================================================
@@ -70,51 +79,23 @@ lgpio.gpio_claim_output(h, PINO_SG90)
 lgpio.gpio_claim_output(h, PINO_PESADO)
 lgpio.gpio_claim_input(h, BUTTON, lgpio.SET_PULL_UP)
 lgpio.gpio_claim_input(h, TCRT)
-# Pinos de motor (IN1..ENB) nao sao claimed aqui - motores vao pela serial
-# da placa Yahboom, nao por GPIO direto.
 
 
 # =========================================================================
-# MOTORES: placa Yahboom via serial (PWM) + SERVOS + BOTAO
+# MOTORES: placa Yahboom via serial
 # =========================================================================
-# Por enquanto so PWM (malha aberta) - sem depender do encoder, que ainda
-# tem problema no lado direito (M1 sem sinal, M3 fraco). Mapeamento real
-# desse robo (nao e o padrao de fabrica da Yahboom):
-#   M1 = dianteira direita (sem encoder) | M2 = traseira esquerda
-#   M3 = traseira direita               | M4 = dianteira esquerda
-# Todo canal usa sinal invertido nesse robo (motor montado espelhado no
-# chassi) - por isso o -1 em cada valor antes de mandar.
 YAHBOOM_BAUDRATE = 115200
 ESCALA_PWM_YAHBOOM = 70  # converte a faixa antiga do L298N (-50..50) pra PWM Yahboom (-3600..3600)
 PWM_FREIO_YAHBOOM = 700   # forca do pulso de freio reverso ao parar
 TEMPO_FREIO_YAHBOOM = 0.08  # segundos do pulso de freio
 
-VEL_MAX = 22
-#22
-VEL_MIN = -VEL_MAX
-
 ANGULO_INICIAL = 90
 
-# Servo pesado como indicador visual de ligado/desligado: levantado (150)
-# enquanto o robo esta ativo, abaixado (0) enquanto parado/esperando o botao.
 SERVO_PESADO_ANGULO_ATIVO = 140
 SERVO_PESADO_ANGULO_PARADO = 90
-TEMPO_ASSENTAMENTO_SERVO_DIRETO = 0.4  # tempo pra segurar o pulso ate o servo assentar antes de cortar o PWM
+TEMPO_ASSENTAMENTO_SERVO_DIRETO = 0.4
 
 def _detectar_porta_yahboom(sair_se_falhar=True):
-    """Acha a porta serial da placa Yahboom pelo VID:PID (1a86:7522, CH340
-    generico), nao por um caminho fisico fixo - assim funciona em
-    qualquer porta USB, nao so a que foi usada quando o caminho foi
-    medido. Mesmo padrao usado pra achar o Arduino mais abaixo
-    (detectar_porta/aguardar_porta).
-
-    De proposito SEM atalho por caminho fixo (by-path): esse caminho e
-    atrelado ao SLOT fisico da porta USB, nao ao dispositivo - se a placa
-    for trocada de porta, um by-path antigo passaria a apontar pra outro
-    dispositivo qualquer (ex: o Arduino), que abre serial sem erro nenhum
-    mas nao e a Yahboom do outro lado. O sintoma seria o robo "conectar"
-    normal e os motores simplesmente nao se mexerem, sem nenhum erro no
-    log - so o VID:PID garante que e o dispositivo certo."""
     for p in serial.tools.list_ports.comports():
         if (p.vid, p.pid) == (0x1a86, 0x7522):
             try:
@@ -131,11 +112,6 @@ def _detectar_porta_yahboom(sair_se_falhar=True):
 
 
 def _aguardar_porta_yahboom(intervalo=1.0):
-    """Espera a placa Yahboom aparecer em vez de derrubar o processo
-    inteiro se ela nao estiver ligada/conectada nesse instante do boot -
-    antes, um serial.Serial() direto aqui crashava o servico inteiro e o
-    systemd ficava reiniciando em loop toda vez que a placa nao estava
-    plugada bem na hora do boot."""
     porta = _detectar_porta_yahboom(sair_se_falhar=False)
     tentativas = 0
     while porta is None:
@@ -143,11 +119,6 @@ def _aguardar_porta_yahboom(intervalo=1.0):
         print(f"[MOTOR] Placa Yahboom ainda nao apareceu, tentando de novo... ({tentativas})")
         time.sleep(intervalo)
         porta = _detectar_porta_yahboom(sair_se_falhar=False)
-    # O dispositivo USB aparece na hora, mas o CH340/firmware da placa
-    # costuma resetar quando a serial e reaberta - sem essa espera, os
-    # primeiros comandos $pwm: saem enquanto ela ainda esta subindo e sao
-    # ignorados (sem erro nenhum, so nao mexe). Mesmo padrao usado no
-    # handshake_serial() do Arduino (ver mais abaixo).
     print("[MOTOR] Placa Yahboom encontrada, esperando ela terminar de subir...")
     time.sleep(2.0)
     print("[MOTOR] Pronta")
@@ -166,29 +137,40 @@ def _enviar_pwm_yahboom(m1, m2, m3, m4):
         reiniciar_processo()
 
 
-_ultima_vel = (0, 0)  # (velL, velR) do ultimo mover(), pra parar() saber pra que lado frear
+_ultima_vel = (0, 0)
 
 
-def aplicar_motor(velL, velR):
-    """Converte velocidade esquerda/direita (faixa antiga do L298N,
-    -VEL_MAX..VEL_MAX) pra PWM da placa Yahboom nos 4 canais. Lado
-    esquerdo = M2+M4, lado direito = M1+M3 (mapeamento real desse robo -
-    ver comentario acima). Sinal invertido em todos os canais porque o
-    motor fica montado espelhado no chassi."""
-    velL = max(min(velL, VEL_MAX), VEL_MIN)
-    velR = max(min(velR, VEL_MAX), VEL_MIN)
-    pwm_esq = velL * ESCALA_PWM_YAHBOOM
-    pwm_dir = velR * ESCALA_PWM_YAHBOOM
-    # (M1, M2, M3, M4) = (direita, esquerda, direita, esquerda).
-    # OBS: o $pwm (malha aberta) saiu com o sinal ao contrario do $spd que
-    # tinhamos validado (robo foi de re) - aqui SEM o "-" extra, sinal
-    # direto, ate confirmar de novo qual convencao bate.
-    _enviar_pwm_yahboom(pwm_dir, pwm_esq, pwm_dir, pwm_esq)
+rampa_ativa = False  # True so enquanto o seguidor esta subindo a rampa/gangorra: libera o teto de velocidade
+VEL_MAX_RAMPA = 80   # teto por roda na rampa (o PWM da placa satura em 3600, ~51 unidades)
 
 
-def mover(velL, velR):
+def aplicar_motor(velL, velR, vel_tras=None, vel_m2=None):
+    """vel_tras != None: rodas TRASEIRAS (M2/M3) nessa velocidade fixa, so
+    nesse comando (o seguidor passa na rampa mais inclinada). Qualquer outro
+    comando - parar(), pausa, gap, re - vem sem ele e as 4 rodas obedecem.
+    vel_m2 != None: so a M2 (traseira esquerda) nessa velocidade, nesse comando."""
+    teto = VEL_MAX_RAMPA if rampa_ativa else VEL_MAX
+    velL = max(min(velL, teto), -teto)
+    velR = max(min(velR, teto), -teto)
+    pwm_esq = -velL * ESCALA_PWM_YAHBOOM
+    pwm_dir = -velR * ESCALA_PWM_YAHBOOM
+    pwm_tras_esq = pwm_esq * GANHO_RODA_TRAS
+    pwm_tras_dir = pwm_dir * GANHO_RODA_TRAS
+    if vel_tras is not None:
+        pwm_tras_esq = pwm_tras_dir = -vel_tras * ESCALA_PWM_YAHBOOM
+    if vel_m2 is not None:
+        pwm_tras_esq = -vel_m2 * ESCALA_PWM_YAHBOOM
+    _enviar_pwm_yahboom(
+        pwm_dir,                       # M1 dianteira direita
+        pwm_tras_esq,                  # M2 traseira esquerda
+        pwm_tras_dir,                  # M3 traseira direita
+        pwm_esq,                       # M4 dianteira esquerda
+    )
+
+
+def mover(velL, velR, vel_tras=None, vel_m2=None):
     global _ultima_vel
-    aplicar_motor(velL, velR)
+    aplicar_motor(velL, velR, vel_tras, vel_m2)
     _ultima_vel = (velL, velR)
 
 
@@ -196,16 +178,15 @@ def parar():
     global _ultima_vel
     velL, velR = _ultima_vel
     if velL != 0 or velR != 0:
-        # pulso curto reverso antes de zerar, reduz a inercia em vez de so
-        # cortar e deixar o robo deslizando - forca do freio convertida de
-        # PWM pra "unidade vel" (mesma escala do aplicar_motor) pra reusar
-        # a mesma conversao/inversao de sinal, sem duplicar logica
         freio_vel = PWM_FREIO_YAHBOOM / ESCALA_PWM_YAHBOOM
         freio_esq = -freio_vel if velL > 0 else (freio_vel if velL < 0 else 0)
         freio_dir = -freio_vel if velR > 0 else (freio_vel if velR < 0 else 0)
         aplicar_motor(freio_esq, freio_dir)
         time.sleep(TEMPO_FREIO_YAHBOOM)
     mover(0, 0)
+
+
+parar_motores = parar
 
 
 def angulo(ang):
@@ -240,12 +221,6 @@ def mover_servo(pino, angulo_alvo, velocidade=100, pulso_min=500, pulso_max=2500
         if delay_por_passo > 0:
             time.sleep(delay_por_passo)
 
-    # range() acima nunca inclui angulo_alvo em si (e exclusivo no limite) -
-    # sem esse pulso final, o ultimo comando enviado ficava 1 passo (2 graus)
-    # curto do alvo, mas _angulo_atual[pino] já registrava o alvo completo.
-    # Some servo ficava "preso" segurando 2 graus fora da posicao marcada
-    # como atual - proximo movimento a partir dai comecava com esse erro
-    # acumulado, o que da bem a cara de "fica tentando corrigir sozinho".
     largura_pulso = pulso_min + (angulo_alvo / 180.0) * (pulso_max - pulso_min)
     try:
         lgpio.tx_servo(h, pino, int(largura_pulso))
@@ -262,9 +237,6 @@ def mover_servo(pino, angulo_alvo, velocidade=100, pulso_min=500, pulso_max=2500
 
 
 def mover_servo_direto(pino, angulo_alvo, pulso_min=500, pulso_max=2500):
-    """Igual mover_servo(), mas sem o passo-a-passo e sem checar_parada() -
-    pra usar de dentro do botao_thread(), onde chamar checar_parada() logo
-    apos limpar robo_ativo abortaria na hora e mataria essa thread."""
     if not hasattr(mover_servo, "_angulo_atual"):
         mover_servo._angulo_atual = {}
     angulo_alvo = max(0, min(180, angulo_alvo))
@@ -272,12 +244,6 @@ def mover_servo_direto(pino, angulo_alvo, pulso_min=500, pulso_max=2500):
     lgpio.tx_servo(h, pino, int(largura_pulso))
     mover_servo._angulo_atual[pino] = angulo_alvo
 
-    # mover_servo() sempre corta o PWM depois de assentar (evita o servo
-    # "brigando" com o sinal o resto da execucao) - essa versao "direta"
-    # deixava o pulso ligado pra sempre depois da chamada, e era isso que
-    # fazia o servo pesado tremer continuamente enquanto o processo rodava
-    # (o tremor sumia so quando o processo morria e o PWM parava de ser
-    # gerado). Segura o pulso so o tempo de assentar e corta, igual mover_servo().
     time.sleep(TEMPO_ASSENTAMENTO_SERVO_DIRETO)
     try:
         lgpio.tx_servo(h, pino, 0)
@@ -285,26 +251,12 @@ def mover_servo_direto(pino, angulo_alvo, pulso_min=500, pulso_max=2500):
         print(f"Falha ao desligar PWM do servo (pino={pino}): {e}")
 
 
-def sensor_e():
-    return lgpio.gpio_read(h, TCRT)
-
-
 def reiniciar_processo():
-    """Reinicia o processo do zero via os.execv - usado quando a placa
-    Yahboom (motor) ou uma camera perdem conexao em tempo de execucao.
-    Resume "por dentro" deixaria estado velho de threads/sensores (buffer
-    de camera travado, serial do motor morta); reiniciar o processo forca
-    tudo a abrir de novo do zero, e o boot (_aguardar_porta_yahboom(),
-    iniciar_camera()) ja fica tentando reconectar sozinho ate conseguir."""
     print("[RECONEXAO] Falha de conexao (motor/camera) - reiniciando processo do zero...")
     try:
         parar()
     except Exception as e:
         print(f"[RECONEXAO][ERRO] Falha ao parar motores antes de reiniciar: {e}")
-    try:
-        parar_gravacao_percurso()
-    except Exception as e:
-        print(f"[RECONEXAO][ERRO] Falha ao parar gravacao antes de reiniciar: {e}")
     try:
         if cap is not None:
             cap.release()
@@ -327,56 +279,45 @@ def reiniciar_processo():
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
+def alternar_botao():
+    if robo_ativo.is_set():
+        robo_ativo.clear()
+        parar()
+        print("[BOTAO] PAUSADO (aperte de novo pra retomar)")
+        try:
+            mover_servo_direto(PINO_PESADO, SERVO_PESADO_ANGULO_PARADO)
+        except Exception as e:
+            print(f"[BOTAO][ERRO] Falha ao abaixar servo pesado: {e}")
+    else:
+        print("[BOTAO] RETOMANDO...")
+        robo_ativo.set()
+        try:
+            mover_servo_direto(PINO_PESADO, SERVO_PESADO_ANGULO_ATIVO)
+        except Exception as e:
+            print(f"[BOTAO][ERRO] Falha ao levantar servo pesado: {e}")
+    return robo_ativo.is_set()
+
+
 def botao_thread():
-    """Toggle rapido: aperta -> pausa o robo na hora (RoboParado interrompe
-    qualquer guinada/desvio/resgate em andamento, ver checar_parada()).
-    Aperta de novo -> retoma, e loop_principal() recomeca do jeito que
-    sempre comeca (reseta erro do PID, giroscopio, motores) antes de voltar
-    a procurar a linha - sem reiniciar o processo inteiro (sem os.execv),
-    entao volta na hora, sem o delay de boot (camera/serial/BNO055) de novo.
-    Falha de verdade (excecao que nao seja RoboParado, tipo camera/serial
-    caindo) nao passa por aqui - quem lida com isso e o except Exception
-    generico no loop de main.py, que tenta de novo sozinho."""
-    anterior = 0
+    # O "botao" e' um interruptor gangorra: cada virada muda o nivel do pino e
+    # ele FICA la. Entao qualquer mudanca de nivel (0->1 ou 1->0) liga/desliga
+    # o robo - reagir so a 0->1 ignorava metade das viradas (dois toques).
+    # `anterior` comeca no nivel real do pino pra nao ver uma virada falsa no
+    # boot (era isso que fazia o robo sair andando sozinho).
+    anterior = lgpio.gpio_read(h, BUTTON)
     while True:
         estado = lgpio.gpio_read(h, BUTTON)
-        if estado == 1 and anterior == 0:
-            time.sleep(0.03)
-            if lgpio.gpio_read(h, BUTTON) == 1:
-                while lgpio.gpio_read(h, BUTTON) == 1:
-                    time.sleep(0.02)
-                if robo_ativo.is_set():
-                    robo_ativo.clear()
-                    parar()
-                    print("[BOTAO] PAUSADO (aperte de novo pra retomar)")
-                    # mover_servo() normal chama checar_parada() a cada passo -
-                    # abortaria na hora (acabamos de limpar robo_ativo) e
-                    # mataria essa propria thread. Por isso a versao direta.
-                    try:
-                        mover_servo_direto(PINO_PESADO, SERVO_PESADO_ANGULO_PARADO)
-                    except Exception as e:
-                        print(f"[BOTAO][ERRO] Falha ao abaixar servo pesado: {e}")
-                else:
-                    print("[BOTAO] RETOMANDO...")
-                    robo_ativo.set()
-                    try:
-                        mover_servo_direto(PINO_PESADO, SERVO_PESADO_ANGULO_ATIVO)
-                    except Exception as e:
-                        print(f"[BOTAO][ERRO] Falha ao levantar servo pesado: {e}")
+        if estado != anterior:
+            time.sleep(0.05)  # repique do contato
+            estado = lgpio.gpio_read(h, BUTTON)
+            if estado != anterior:
+                alternar_botao()
         anterior = estado
         time.sleep(0.02)
 
 
 # =========================================================================
-# BNO055 DIRETO NA RASP (modo IMUPLUS: fusao interna de acel+giro, SEM
-# magnetometro). O modo de fusao NDOF usa o magnetometro pra achar o norte -
-# perto dos motores/ponte H a interferencia magnetica fazia o heading
-# "pular"/resetar sozinho quando o robo mexia, entao o magnetometro continua
-# fora. Mas o eixo Z (heading/yaw, usado pelas guinadas) agora vem PRONTO da
-# fusao interna do chip em vez de integrar o giro cru em software - o chip
-# faz compensacao de deriva/temperatura melhor do que a integracao manual.
-# X e Y continuam exatamente como antes (giro cru integrado em software e
-# acelerometro cru, respectivamente) - nada mudou neles.
+# BNO055 DIRETO NA RASP
 # =========================================================================
 _gyro_lock = threading.Lock()
 BNO_ADDR        = 0x29  # 0x28 se o pino ADR do modulo estiver em GND
@@ -389,10 +330,10 @@ GYR_DATA_X      = 0x14  # giroscopio cru (x,y,z) - 16 LSB = 1 grau/s
 ACC_DATA_X      = 0x08  # acelerometro cru (x,y,z)
 EUL_DATA_HEADING = 0x1A  # heading (yaw) ja calculado pela fusao - 16 LSB = 1 grau
 MODO_CONFIG     = 0x00
-MODO_ACCGYRO    = 0x05  # acel + giro crus, sem magnetometro e sem fusao interna (nao usado mais - so referencia)
+MODO_ACCGYRO    = 0x05
 MODO_IMUPLUS    = 0x08  # fusao 6DOF (acel+giro) sem magnetometro - da heading/roll/pitch prontos
 CHIP_ID_ESPERADO = 0xA0
-LIMITE_DPS_PLAUSIVEL = 2000.0  # fundo de escala do giroscopio - acima disso e leitura corrompida
+LIMITE_DPS_PLAUSIVEL = 2000.0
 bus = smbus2.SMBus(1)
 
 ang_gyro          = {"X": 0.0, "Y": 0.0, "Z": 0.0}
@@ -400,7 +341,8 @@ gyro_offset       = {"X": 0.0, "Y": 0.0, "Z": 0.0}
 gyro_ultimo_tempo = time.time()
 
 _angulo_y_filtrado = None
-_heading_offset = 0.0  # heading (fusao) no momento do ultimo resetar_giroscopio() - vira o "zero" da guinada
+_angulo_y_rapido = None
+_heading_offset = 0.0
 _ultimo_angulo_z = [0]  # cache do ultimo angulo_z() valido, pra nao quebrar guinada numa falha I2C isolada
 
 
@@ -411,10 +353,6 @@ def _bno_write(reg, val):
 def _bno_read_word(reg, tentativas=3):
     for tentativa in range(tentativas):
         try:
-            # BNO055 guarda LSB no endereco base e MSB no endereco+1 (ordem
-            # OPOSTA do MPU6050, que guarda MSB primeiro) - inverter isso
-            # aqui e o que fazia o giroscopio ler lixo (byte trocado) e o
-            # angulo Z "explodir" pra qualquer valor entre -180 e 180.
             lo = bus.read_byte_data(BNO_ADDR, reg)
             hi = bus.read_byte_data(BNO_ADDR, reg + 1)
 
@@ -426,7 +364,6 @@ def _bno_read_word(reg, tentativas=3):
             return valor
 
         except OSError as e:
-            # Remote I/O error (121), muito comum em impactos
             if tentativa == tentativas - 1:
                 raise
             time.sleep(0.001)
@@ -439,8 +376,6 @@ def _normalizar(ang):
 
 
 def _ler_heading_bruto():
-    """Heading (yaw) 0-360 graus ja calculado pela fusao interna do chip -
-    substitui a integracao manual do giro cru pra esse eixo."""
     with _gyro_lock:
         return _bno_read_word(EUL_DATA_HEADING) / 16.0
 
@@ -468,13 +403,10 @@ def resetar_giroscopio():
         print(f"[BNO055] Falha ao ler heading pro reset ({e}), mantendo offset anterior.")
 
 
-def angulo_x(): return int(ang_gyro["X"])
 def angulo_y(): return angulo_y_estavel()
 
 
 def angulo_z():
-    """Yaw relativo ao ultimo resetar_giroscopio(), vindo do heading ja
-    calculado pela fusao do chip (nao mais integracao de giro cru)."""
     try:
         atual = _ler_heading_bruto()
         _ultimo_angulo_z[0] = int(_normalizar(atual - _heading_offset))
@@ -494,20 +426,10 @@ def _gyro_thread():
             if dt > 0.5:
                 time.sleep(0.005)
                 continue
-            # Lock tambem durante a leitura crua (nao so na atualizacao do
-            # dict) - agora angulo_z() faz leitura I2C do heading fundido a
-            # partir da thread principal (guinada), concorrente com essa
-            # thread. Sem o lock aqui, as duas podiam intercalar leituras
-            # multi-byte no mesmo barramento e corromper o valor lido.
             with _gyro_lock:
                 gx = (_bno_read_word(GYR_DATA_X)     - gyro_offset["X"]) / 16.0
                 gy = (_bno_read_word(GYR_DATA_X + 2) - gyro_offset["Y"]) / 16.0
                 gz = (_bno_read_word(GYR_DATA_X + 4) - gyro_offset["Z"]) / 16.0
-            # Fundo de escala do giroscopio e 2000 dps - qualquer valor acima
-            # disso e fisicamente impossivel, e leitura corrompida (ruido
-            # eletrico dos motores no barramento I2C, mais comum durante
-            # guinada/desvio com motor puxando corrente). Integrar isso
-            # jogava o angulo acumulado centenas de graus com 1 amostra so.
             if max(abs(gx), abs(gy), abs(gz)) > LIMITE_DPS_PLAUSIVEL:
                 print(f"[BNO055] Amostra de giro implausivel descartada (X={gx:.0f} Y={gy:.0f} Z={gz:.0f} dps)")
                 time.sleep(0.005)
@@ -516,11 +438,6 @@ def _gyro_thread():
                 ang_gyro["X"] = _normalizar(ang_gyro["X"] + gx * dt)
                 ang_gyro["Y"] = _normalizar(ang_gyro["Y"] + gy * dt)
                 ang_gyro["Z"] = _normalizar(ang_gyro["Z"] + gz * dt)
-            # BNO055 so produz amostra nova de giro a ~100Hz (a cada 10ms) -
-            # sem essa pausa a thread ficava martelando o I2C em loop fechado
-            # o tempo todo (parado ou andando, nao tem como desligar), so
-            # relendo a MESMA amostra varias vezes, ocupando um nucleo
-            # inteiro a toa e disputando I2C/CPU com o resto do sistema.
             time.sleep(0.005)
         except OSError as e:
             print(f"[BNO055] Gyro I2C: {e}")
@@ -532,13 +449,11 @@ def _gyro_thread():
 
 
 def iniciar_mpu():
-    """Nome mantido por compatibilidade com quem ja importa/chama
-    config.iniciar_mpu (main.py) - por dentro agora inicializa o BNO055."""
     _bno_write(REG_OPR_MODE, MODO_CONFIG)
     time.sleep(0.02)
     _bno_write(REG_SYS_TRIGGER, 0x20)  # reset
     time.sleep(0.65)
-    for _ in range(20):  # espera o chip voltar a responder apos o reset
+    for _ in range(20):
         try:
             if bus.read_byte_data(BNO_ADDR, REG_CHIP_ID) == CHIP_ID_ESPERADO:
                 break
@@ -559,15 +474,12 @@ def iniciar_mpu():
 
 
 # ==========================================================
-# ANGULO Y ESTAVEL (RAMPA/GANGORRA)
-# Usa somente o acelerometro + filtro exponencial
+# ANGULO Y ESTAVEL
 # ==========================================================
 def angulo_y_estavel(alpha=0.97):
     global _angulo_y_filtrado
 
     try:
-        # Sem normalizar pela escala (100 LSB = 1 m/s^2 no BNO055) porque
-        # atan2 usa so a RAZAO entre os eixos - o fator de escala cancela.
         ax = _bno_read_word(ACC_DATA_X)
         ay = _bno_read_word(ACC_DATA_X + 2)
         az = _bno_read_word(ACC_DATA_X + 4)
@@ -593,13 +505,34 @@ def angulo_y_estavel(alpha=0.97):
 
     return int(_angulo_y_filtrado)
 
+def angulo_y_rapido(alpha=0.8):
+    """Mesmo angulo do angulo_y_estavel, mas com filtro bem mais leve (0.8 em
+    vez de 0.97) e com estado proprio - reage rapido, usado so pra detectar a
+    saida da rampa. Nao mexe no angulo_y() normal."""
+    global _angulo_y_rapido
+    try:
+        ax = _bno_read_word(ACC_DATA_X)
+        ay = _bno_read_word(ACC_DATA_X + 2)
+        az = _bno_read_word(ACC_DATA_X + 4)
+        angulo = math.degrees(math.atan2(-ax, math.sqrt(ay * ay + az * az)))
+        if _angulo_y_rapido is None:
+            _angulo_y_rapido = angulo
+        else:
+            _angulo_y_rapido = alpha * _angulo_y_rapido + (1 - alpha) * angulo
+    except OSError as e:
+        print(f"[BNO055] Falha I2C ({e}), mantendo último valor.")
+    if _angulo_y_rapido is None:
+        return 0
+    return _angulo_y_rapido
+
+
 
 # =========================================================================
 # SERIAL - so sonar (F e E)
 # =========================================================================
 PORTA_FIXA = "/dev/serial/by-id/usb-FTDI_USB_Serial_Converter_FTB6SPL3-if00-port0"
 SERIAL_TIMEOUT_DADO = 0.5
-WATCHDOG_RECONEXAO = 2.0  # segundos sem dado novo pra forcar reconexao da porta
+WATCHDOG_RECONEXAO = 2.0
 
 dados = {"F": 9999.0, "E": 9999.0}
 ultimo_recebimento = time.time()
@@ -616,13 +549,6 @@ def detectar_porta(sair_se_falhar=True):
 
     PALAVRAS_FTDI = ["ftdi", "ft232", "usb serial converter", "ftb6spl3"]
     portas = serial.tools.list_ports.comports()
-    # A porta da placa Yahboom ja foi achada por VID:PID (ver
-    # _detectar_porta_yahboom) - nunca pode ser tambem a porta do Arduino,
-    # senao os dois ficam abrindo o MESMO device concorrentemente (visto ao
-    # vivo: PWM do motor falhando com I/O error e o sonar nunca recebendo
-    # dado valido, preso reconectando). So acontece quando o caminho fixo e
-    # a busca por palavra-chave FTDI abaixo falham e cai no fallback
-    # generico - mas vale excluir nos dois pra garantir.
     porta_motor = motor_serial.port if motor_serial is not None else None
 
     for p in portas:
@@ -752,7 +678,7 @@ def sonar_valido():
 
 
 # =========================================================================
-# RESET DE USB VIA SOFTWARE (sem tirar/colocar cabo)
+# RESET DE USB VIA SOFTWARE
 # =========================================================================
 USBDEVFS_RESET = 21780  # 0x5514 -> _IO('U', 20), constante do kernel Linux
 
@@ -777,7 +703,79 @@ def _achar_bus_dev(video_path):
     return None, None
 
 
-def resetar_usb_camera(video_path_ou_indice):
+def _achar_bus_dev_por_vid(vid):
+    base = "/sys/bus/usb/devices"
+    try:
+        for nome in os.listdir(base):
+            d = os.path.join(base, nome)
+            try:
+                with open(os.path.join(d, "idVendor")) as f:
+                    if f.read().strip().lower() != vid:
+                        continue
+                with open(os.path.join(d, "busnum")) as f:
+                    busnum = int(f.read().strip())
+                with open(os.path.join(d, "devnum")) as f:
+                    devnum = int(f.read().strip())
+                return busnum, devnum
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        pass
+    return None, None
+
+
+def _achar_porta_usb_por_vid(vid):
+    base = "/sys/bus/usb/devices"
+    try:
+        for nome in os.listdir(base):
+            if ":" in nome or nome.startswith("usb"):
+                continue
+            try:
+                with open(os.path.join(base, nome, "idVendor")) as f:
+                    if f.read().strip().lower() != vid:
+                        continue
+            except OSError:
+                continue
+            if "." in nome:
+                hub, porta = nome.rsplit(".", 1)
+            else:
+                hub, porta = nome.split("-", 1)
+            return hub, porta
+    except OSError:
+        pass
+    return None, None
+
+
+USB_CICLO_ENERGIA_SEGUNDOS = 3
+
+
+def ciclar_energia_usb(vid):
+    hub, porta = _achar_porta_usb_por_vid(vid)
+    if hub is None:
+        print(f"[USB][AVISO] Ciclo de energia: nao achei device {vid} no USB (cabo solto?)")
+        return False
+    uhubctl = "/usr/sbin/uhubctl"
+    if not os.path.exists(uhubctl):
+        print("[USB][AVISO] uhubctl nao instalado - sem ciclo de energia")
+        return False
+    print(f"[USB] Cortando energia da porta {hub}.{porta} por {USB_CICLO_ENERGIA_SEGUNDOS}s e religando...")
+    try:
+        r = subprocess.run(
+            ["sudo", "-n", uhubctl, "-l", hub, "-p", porta, "-a", "cycle",
+             "-d", str(USB_CICLO_ENERGIA_SEGUNDOS)],
+            capture_output=True, text=True, timeout=USB_CICLO_ENERGIA_SEGUNDOS + 15)
+    except Exception as e:
+        print(f"[USB][ERRO] Falha no ciclo de energia: {e}")
+        return False
+    if r.returncode != 0:
+        print(f"[USB][ERRO] uhubctl retornou {r.returncode}: {(r.stderr or r.stdout).strip()[:150]}")
+        return False
+    time.sleep(4.0)
+    print("[USB] Ciclo de energia concluido")
+    return True
+
+
+def resetar_usb_camera(video_path_ou_indice, vid=None):
 
     if isinstance(video_path_ou_indice, int):
         video_path = f"/dev/video{video_path_ou_indice}"
@@ -786,7 +784,11 @@ def resetar_usb_camera(video_path_ou_indice):
 
     ok = False
     try:
-        busnum, devnum = _achar_bus_dev(video_path)
+        busnum, devnum = (None, None)
+        if os.path.exists(video_path):
+            busnum, devnum = _achar_bus_dev(video_path)
+        if busnum is None and vid:
+            busnum, devnum = _achar_bus_dev_por_vid(vid)
         if busnum is not None:
             usb_node = f"/dev/bus/usb/{busnum:03d}/{devnum:03d}"
             fd = os.open(usb_node, os.O_WRONLY)
@@ -804,13 +806,6 @@ def resetar_usb_camera(video_path_ou_indice):
     except Exception as e:
         print("[USB][ERRO] Falha no reset via ioctl:", e)
 
-    try:
-        subprocess.run(["uhubctl"], capture_output=True, timeout=2)
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
-
     time.sleep(1.0)
     return ok
 
@@ -820,36 +815,19 @@ def resetar_usb_camera(video_path_ou_indice):
 # =========================================================================
 CAMERA_LINHA_PATH  = "/dev/v4l/by-id/usb-Jieli_Technology_USB_Composite_Device-video-index0"
 CAMERA_LINHA_INDEX_FALLBACK  = 0
-CAMERA_VITIMA_INDEX_FALLBACK = 2  # so pra nunca "roubar" esse indice na varredura abaixo
-CAMERA_VITIMA_PATH = "/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0"  # mesma string de resgate_de_vitimas.py - usada so pra NUNCA roubar essa camera no fallback abaixo
+CAMERA_VITIMA_INDEX_FALLBACK = 2
+CAMERA_VITIMA_PATH = "/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0"
+CAMERA_LINHA_USB_VID = "4c4a"
 
-camera_x = 160
-camera_y = 120
+USB_CICLO_ENERGIA_A_PARTIR_DA_TENTATIVA = 2
+USB_RESET_TENTATIVAS_ANTES_DE_RESETAR = 1  # 3 - falhas seguidas antes de tentar resetar USB (cada falha custa ~20 s de select() timeout, 3 = mais de 1 min travado no boot)
 
-USB_RESET_TENTATIVAS_ANTES_DE_RESETAR = 3  # falhas seguidas antes de tentar resetar USB
-
-# So "ret=True" no read() nao basta - depois de um reconnect/reset USB o
-# device pode abrir e ler frame "com sucesso" mas entregar imagem toda
-# preta/travada (interface errada, sensor ainda nao assentou, etc.) - o
-# robo aceitava essa camera como valida e andava cego, ignorando a linha
-# achando que era gap o tempo todo. frame.std() de uma imagem preta/
-# uniforme fica ~0; qualquer cena real (mesmo escura) tem variacao de
-# pixel bem maior que isso.
 LIMIAR_DESVIO_FRAME_VALIDO = 3.0
 
 cap = None  # atribuido por iniciar_camera()
 
 
 def abrir_camera_generica(fonte):
-    """Helper generico de abertura - usado tanto pra camera de linha
-    (detectar_camera abaixo) quanto pra camera de vitima
-    (resgate_de_vitimas.py). Nao aceita so por ret=True - se a leitura deu
-    certo mas o frame vier preto/travado, tenta mais algumas vezes (a
-    primeira leitura as vezes ainda vem preta mesmo em camera boa, por
-    sensor ainda assentando) e so aceita se algum frame tiver variacao
-    real de pixel (ver LIMIAR_DESVIO_FRAME_VALIDO). Se a leitura FALHAR
-    (ret=False), desiste na hora - nao insiste 3x numa fonte que nem
-    consegue ler, isso so triplicava o tempo de timeout em fonte morta."""
     cap_local = cv2.VideoCapture(fonte, cv2.CAP_V4L2)
     if cap_local.isOpened():
         for _ in range(3):
@@ -863,8 +841,6 @@ def abrir_camera_generica(fonte):
 
 
 def _resolver_dev_real(fonte):
-    """Resolve indice/path pro /dev/videoN real por tras (segue symlink de
-    by-id). None se nao existir/nao conseguir resolver."""
     if isinstance(fonte, int):
         fonte = f"/dev/video{fonte}"
     try:
@@ -874,40 +850,42 @@ def _resolver_dev_real(fonte):
 
 
 def _e_camera_de_vitima(fonte):
-    """True se `fonte` (indice ou path) resolve pro MESMO dispositivo
-    fisico da camera de vitima/resgate. Um indice fixo reservado
-    (CAMERA_VITIMA_INDEX_FALLBACK) sozinho nao basta - a ordem de
-    enumeracao USB NAO e fixa entre reconexoes (ja vimos ela mudar na
-    pratica), entao o indice "reservado" podia apontar pra outra coisa e
-    deixar a varredura "roubar" a camera de vitima mesmo assim sem
-    perceber - comparando o /dev/videoN real resolvido agora, nao um
-    numero decorado, isso nao acontece mais."""
     alvo = _resolver_dev_real(fonte)
     vitima = _resolver_dev_real(CAMERA_VITIMA_PATH)
     return alvo is not None and alvo == vitima
 
 
+def _e_no_de_captura(i):
+    if not os.path.exists(f"/dev/video{i}"):
+        return False
+    try:
+        with open(f"/sys/class/video4linux/video{i}/index") as f:
+            if f.read().strip() != "0":
+                return False
+        driver = os.path.realpath(f"/sys/class/video4linux/video{i}/device/driver")
+        return os.path.basename(driver) == "uvcvideo"
+    except OSError:
+        return True  # sem info no sysfs - deixa tentar
+
+
 def detectar_camera():
-    if CAMERA_LINHA_PATH:
+    if CAMERA_LINHA_PATH and os.path.exists(CAMERA_LINHA_PATH):
         c = abrir_camera_generica(CAMERA_LINHA_PATH)
         if c is not None:
             print(f"[Camera] Linha conectada em {CAMERA_LINHA_PATH}")
             return c
 
-    if not _e_camera_de_vitima(CAMERA_LINHA_INDEX_FALLBACK):
+    elif CAMERA_LINHA_PATH:
+        print(f"[Camera][AVISO] Camera de linha sumiu do USB ({CAMERA_LINHA_PATH} nao existe) - cabo/conector?")
+
+    if _e_no_de_captura(CAMERA_LINHA_INDEX_FALLBACK) and not _e_camera_de_vitima(CAMERA_LINHA_INDEX_FALLBACK):
         c = abrir_camera_generica(CAMERA_LINHA_INDEX_FALLBACK)
         if c is not None:
             print(f"[Camera] Linha conectada no indice {CAMERA_LINHA_INDEX_FALLBACK}")
             return c
-    else:
-        print(f"[Camera][AVISO] Indice {CAMERA_LINHA_INDEX_FALLBACK} e a camera de vitima agora (enumeracao mudou) - pulando")
 
-    # Ultimo recurso: varre indices, mas NUNCA aceita o dispositivo real da
-    # camera de vitima - comparando o /dev/videoN de verdade (nao so um
-    # indice fixo), ja que a enumeracao USB pode mudar a ordem entre
-    # reconexoes e um numero decorado deixa de proteger nada.
     for i in range(10):
-        if _e_camera_de_vitima(i):
+        if i == CAMERA_LINHA_INDEX_FALLBACK or not _e_no_de_captura(i) or _e_camera_de_vitima(i):
             continue
         c = abrir_camera_generica(i)
         if c is not None:
@@ -925,8 +903,15 @@ def iniciar_camera():
         print(f"[Camera] Tentando novamente em 1s... (tentativa {tentativas})")
         time.sleep(1)
         if tentativas % USB_RESET_TENTATIVAS_ANTES_DE_RESETAR == 0:
-            print("[Camera] Varias falhas seguidas, tentando resetar USB...")
-            resetar_usb_camera(CAMERA_LINHA_PATH or CAMERA_LINHA_INDEX_FALLBACK)
+            if tentativas >= USB_CICLO_ENERGIA_A_PARTIR_DA_TENTATIVA:
+                print("[Camera] Reset por software nao resolveu, cortando a energia da porta USB...")
+                if not ciclar_energia_usb(CAMERA_LINHA_USB_VID):
+                    resetar_usb_camera(CAMERA_LINHA_PATH or CAMERA_LINHA_INDEX_FALLBACK,
+                                       vid=CAMERA_LINHA_USB_VID)
+            else:
+                print("[Camera] Falha na camera, tentando resetar USB...")
+                resetar_usb_camera(CAMERA_LINHA_PATH or CAMERA_LINHA_INDEX_FALLBACK,
+                                   vid=CAMERA_LINHA_USB_VID)
         cap_local = detectar_camera()
     cap_local.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap_local.set(3, camera_x)
@@ -935,102 +920,4 @@ def iniciar_camera():
     return cap_local
 
 
-# =========================================================================
-# GRAVACAO DO PERCURSO (camera da frente/resgate)
-# =========================================================================
-# Liga/desliga com GRAVAR_PERCURSO no topo do main.py. Grava com uma captura
-# PROPRIA (separada de cap/cap_vitima) so pra isso - so seguro chamar em
-# processos que nao estejam usando essa camera pra mais nada (o seguidor nao
-# usa; resgate.py, que ja tem essa camera aberta pra bola/triangulo, tem sua
-# PROPRIA logica de gravacao por cima do cap dele, sem abrir uma segunda
-# captura concorrente no mesmo dispositivo).
-#
-# Cada trecho do percurso (seguidor, resgate) vira um .mp4 separado dentro de
-# video_rounds/, todos com o mesmo prefixo de round - persistido em /tmp
-# (mesma ideia do norte absoluto de movimentos_bases.py: sobrevive a troca de
-# processo via execv, some sozinho quando a Pi reinicia, entao uma rodada nova
-# comeca um round novo).
-CAMERA_FRENTE_RESGATE_PATH = "/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0"
-VIDEO_ROUNDS_DIR = "video_rounds"
-_ARQUIVO_ROUND_VIDEO = "/tmp/robo_dogo_video_round.txt"
-
-_cap_gravacao = None
-_writer_gravacao = None
-_gravando = threading.Event()
-
-
-def id_do_round_video():
-    if os.path.exists(_ARQUIVO_ROUND_VIDEO):
-        try:
-            with open(_ARQUIVO_ROUND_VIDEO) as f:
-                round_id = f.read().strip()
-            if round_id:
-                return round_id
-        except Exception as e:
-            print(f"[GRAVACAO] Falha ao ler round salvo ({e}), gerando novo")
-    round_id = time.strftime("%Y-%m-%d_%H-%M-%S")
-    try:
-        with open(_ARQUIVO_ROUND_VIDEO, "w") as f:
-            f.write(round_id)
-    except Exception as e:
-        print(f"[GRAVACAO] Falha ao salvar round ({e})")
-    return round_id
-
-
-def _proximo_nome_video(round_id, sufixo):
-    n = 1
-    while True:
-        caminho = os.path.join(VIDEO_ROUNDS_DIR, f"{round_id}_{sufixo}_{n}.mp4")
-        if not os.path.exists(caminho):
-            return caminho
-        n += 1
-
-
-def _loop_gravacao():
-    while _gravando.is_set():
-        ret, frame = _cap_gravacao.read()
-        if ret:
-            _writer_gravacao.write(frame)
-        else:
-            time.sleep(0.05)
-
-
-def iniciar_gravacao_percurso(ativado, sufixo="seguidor"):
-    global _cap_gravacao, _writer_gravacao
-    if not ativado:
-        return
-    try:
-        os.makedirs(VIDEO_ROUNDS_DIR, exist_ok=True)
-        caminho = _proximo_nome_video(id_do_round_video(), sufixo)
-        cap_local = cv2.VideoCapture(CAMERA_FRENTE_RESGATE_PATH, cv2.CAP_V4L2)
-        if not cap_local.isOpened():
-            print(f"[GRAVACAO] Nao consegui abrir a camera de resgate ({CAMERA_FRENTE_RESGATE_PATH}) pra gravar")
-            return
-        largura = int(cap_local.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
-        altura = int(cap_local.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
-        writer_local = cv2.VideoWriter(caminho, cv2.VideoWriter_fourcc(*"mp4v"), 20.0, (largura, altura))
-        _cap_gravacao = cap_local
-        _writer_gravacao = writer_local
-        _gravando.set()
-        Thread(target=_loop_gravacao, daemon=True).start()
-        print(f"[GRAVACAO] Gravando percurso em {caminho}")
-    except Exception as e:
-        print(f"[GRAVACAO][ERRO] Falha ao iniciar gravacao: {e}")
-
-
-def parar_gravacao_percurso():
-    global _cap_gravacao, _writer_gravacao
-    _gravando.clear()
-    time.sleep(0.15)
-    try:
-        if _writer_gravacao is not None:
-            _writer_gravacao.release()
-    except Exception:
-        pass
-    try:
-        if _cap_gravacao is not None:
-            _cap_gravacao.release()
-    except Exception:
-        pass
-    _writer_gravacao = None
-    _cap_gravacao = None
+from movimentos_bases import guinada2
